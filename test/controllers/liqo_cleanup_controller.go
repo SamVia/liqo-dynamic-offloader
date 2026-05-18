@@ -24,12 +24,12 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	logger := log.FromContext(ctx)
 	namespace := req.Namespace
 
-	// Ignore system namespaces
+	// Exclude system and critical namespaces to prevent accidental deletion of their offloading configurations.
 	if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" || namespace == "crownlabs-system" {
 		return ctrl.Result{}, nil
 	}
 
-	// 1. Check if the NamespaceOffloading exists.
+	// Verify if a NamespaceOffloading resource exists for the current namespace.
 	offloadCR := &unstructured.Unstructured{}
 	offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "offloading.liqo.io",
@@ -38,59 +38,59 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	})
 
 	if err := r.Get(ctx, client.ObjectKey{Name: "offloading", Namespace: namespace}, offloadCR); err != nil {
-		// If it's already gone, our job is done.
+		// If the resource is not found, the cleanup is already complete.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 2. List all Pods currently in this namespace
+	// Retrieve all Pods within the namespace to evaluate their current scheduling and execution status.
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, client.InNamespace(namespace)); err != nil {
 		logger.Error(err, "Failed to list pods in namespace")
 		return ctrl.Result{}, err
 	}
 
-	// 3. Count active remote pods
+	// Calculate the number of active Pods that rely on the remote cluster.
 	activeOffloadedPods := 0
 	for _, pod := range podList.Items {
-		// Ignore pods that have cleanly finished or died
+		// Exclude pods that have reached a terminal state.
 		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
 			continue
 		}
 
-		// CONDITION A: Did the pod explicitly ask for the remote node?
+		// Condition A: The pod explicitly requests scheduling on the remote cluster via NodeSelector.
 		explicitTarget := pod.Spec.NodeSelector != nil && pod.Spec.NodeSelector["kubernetes.io/hostname"] == "cluster-remote"
 
-		// CONDITION B: Is Liqo actively running this pod on the remote node?
+		// Condition B: The pod has already been scheduled and is running on the remote node.
 		scheduledRemote := pod.Spec.NodeName == "cluster-remote"
 
-		// CONDITION C (FIXED): Is the pod Pending, AND it explicitly wants the remote cluster?
-		// We no longer trigger on purely local pending pods.
+		// Condition C: The pod is pending scheduling specifically for the remote cluster.
+		// This ensures we do not block cleanup for pending pods intended for local nodes.
 		isPendingRemote := pod.Status.Phase == corev1.PodPending && pod.Spec.NodeName == "" && explicitTarget
 
 		if explicitTarget || scheduledRemote || isPendingRemote {
 			activeOffloadedPods++
 		}
-	}	
+	}
 
-	// 4. The Action: Lock the door if empty
+	// If no active remote pods remain, proceed to revoke the offloading configuration.
 	if activeOffloadedPods == 0 {
-		// Only try to delete if we successfully fetched it in step 1
+		// Confirm the resource was successfully fetched before attempting deletion.
 		if offloadCR.GetUID() != "" {
-			logger.Info("🧹 ZERO active remote pods remain. Initiating lockdown...", "namespace", namespace)
-			
+			logger.Info("Zero active remote pods remain. Initiating offload cleanup.", "namespace", namespace)
+
 			if err := r.Delete(ctx, offloadCR); client.IgnoreNotFound(err) != nil {
-				logger.Error(err, "❌ Failed to delete NamespaceOffloading")
+				logger.Error(err, "Failed to delete NamespaceOffloading")
 				return ctrl.Result{}, err
 			}
-			logger.Info("🔒 SUCCESS: NamespaceOffloading destroyed. Namespace is strictly isolated again.", "namespace", namespace)
+			logger.Info("Successfully deleted NamespaceOffloading. Namespace isolation restored.", "namespace", namespace)
 		}
 	}
 	return ctrl.Result{}, nil
 }
 
 func (r *LiqoCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// THE FIX: Event filtering to save CPU.
-	// We only care about Pod state changes that affect our counting logic.
+	// Optimize the controller by filtering events to reduce unnecessary Reconcile calls.
+	// We only trigger reconciliation when pod state changes affect our remote counting logic.
 	podStateChangePredicate := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool { return true },
 		DeleteFunc: func(e event.DeleteEvent) bool { return true },
@@ -100,7 +100,8 @@ func (r *LiqoCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			if !okOld || !okNew {
 				return false
 			}
-			// Only trigger if Phase or NodeName changed (ignore readiness probe updates, annotations, etc.)
+			// Trigger reconciliation only if the Pod's Phase or assigned Node changes.
+			// This safely ignores updates to annotations, labels, or readiness probes.
 			return oldPod.Status.Phase != newPod.Status.Phase || oldPod.Spec.NodeName != newPod.Spec.NodeName
 		},
 	}

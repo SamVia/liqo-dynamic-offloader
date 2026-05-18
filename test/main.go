@@ -20,7 +20,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 🧠 Brain 1: The Trap Door (Opens namespaces when needed)
+	// namespace offloading controller to enable the offloading of namespaces to remote clusters
 	if err = (&controllers.LiqoTrapReconciler{
 		Client: mgr.GetClient(),
 	}).SetupWithManager(mgr); err != nil {
@@ -28,7 +28,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 🧹 Brain 2: The Garbage Collector (Locks namespaces when empty)
+	// namespace cleanup controller to enable the cleanup of namespaces offloading
 	if err = (&controllers.LiqoCleanupReconciler{
 		Client: mgr.GetClient(),
 	}).SetupWithManager(mgr); err != nil {

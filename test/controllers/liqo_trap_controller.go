@@ -16,7 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
-// LiqoTrapReconciler reconciles a Liqo Pod trap event
+// LiqoTrapReconciler monitors for specific Kubernetes events indicating a pod
+// scheduling trap due to missing Liqo offloading configurations.
 type LiqoTrapReconciler struct {
 	client.Client
 }
@@ -28,7 +29,7 @@ type LiqoTrapReconciler struct {
 func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// 1. Fetch the Event
+	// Retrieve the specific Event triggering the reconciliation.
 	var evt corev1.Event
 	if err := r.Get(ctx, req.NamespacedName, &evt); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -37,17 +38,19 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	namespace := evt.InvolvedObject.Namespace
 	podName := evt.InvolvedObject.Name
 
-	// 2. Ignore critical system namespaces
+	// Exclude critical system namespaces to avoid inadvertently applying
+	// offloading policies to core control plane or storage components.
 	if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" || namespace == "crownlabs-system" {
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("🚨 ERROR DETECTED: Missing NamespaceOffloading! Initiating Auto-Heal...",
+	logger.Info("Missing NamespaceOffloading detected for pod. Initiating remediation.",
 		"namespace", namespace,
 		"pod", podName,
 	)
 
-	// 3. Construct the unstructured NamespaceOffloading CR
+	// Construct the unstructured NamespaceOffloading Custom Resource
+	// to define the remote execution policy for this namespace.
 	offloadCR := &unstructured.Unstructured{}
 	offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "offloading.liqo.io",
@@ -74,41 +77,43 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		},
 	}
 
-	// 4. Apply the Offloading Policy
+	// Apply the NamespaceOffloading policy to the target namespace.
 	err := r.Create(ctx, offloadCR)
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			logger.Info("⚠️ NamespaceOffloading already exists. Proceeding to pod kick...", "namespace", namespace)
+			logger.Info("NamespaceOffloading already exists. Proceeding to delete the trapped pod.", "namespace", namespace)
 		} else {
-			logger.Error(err, "❌ Failed to create NamespaceOffloading policy")
+			logger.Error(err, "Failed to create NamespaceOffloading policy")
 			return ctrl.Result{}, err
 		}
 	} else {
-		// THE FIX: Requeue instead of time.Sleep
-		// We successfully created the policy. We now put this event back in the queue
-		// to give Liqo's mutating webhooks time to register the new policy before we delete the pod.
-		logger.Info("✅ SUCCESS: Auto-applied NamespaceOffloading! Requeueing to allow webhook registration...", "namespace", namespace)
+		// Requeue the request after creation rather than sleeping. This yields the thread
+		// and provides Liqo's mutating webhooks sufficient time to process the new policy
+		// before we attempt to delete the pod.
+		logger.Info("Successfully applied NamespaceOffloading. Requeueing to allow webhook registration.", "namespace", namespace)
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
-	// 5. Kick the trapped pod (Only reached if the policy already existed or we just came back from a Requeue)
+	// Delete the trapped pod. This step is reached either if the policy already existed
+	// or during the requeue following a successful policy creation.
 	var stuckPod corev1.Pod
 	if err := r.Get(ctx, client.ObjectKey{Name: podName, Namespace: namespace}, &stuckPod); err == nil {
 
-		// Production Best Practice: Use Background Deletion so the API server doesn't hang our client
+		// Utilize Background deletion propagation to ensure the API server handles
+		// garbage collection asynchronously, preventing the client from hanging.
 		deletePolicy := metav1.DeletePropagationBackground
 		deleteOpts := &client.DeleteOptions{
 			PropagationPolicy: &deletePolicy,
 		}
 
 		if err := r.Delete(ctx, &stuckPod, deleteOpts); err != nil {
-			logger.Error(err, "❌ Failed to kick the stuck pod", "pod", podName)
-			// Return error to trigger a rapid retry
+			logger.Error(err, "Failed to delete the stuck pod", "pod", podName)
+			// Returning the error triggers the controller's backoff retry mechanism.
 			return ctrl.Result{}, err
 		}
-		logger.Info("♻️ Kicked the stuck pod. The Deployment/ReplicaSet will now spawn a new one!", "pod", podName)
+		logger.Info("Successfully deleted the stuck pod. The managing controller (e.g., ReplicaSet) should provision a replacement.", "pod", podName)
 	} else if !apierrors.IsNotFound(err) {
-		logger.Error(err, "❌ Failed to fetch the stuck pod for deletion", "pod", podName)
+		logger.Error(err, "Failed to fetch the stuck pod for deletion", "pod", podName)
 		return ctrl.Result{}, err
 	}
 
@@ -117,7 +122,9 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LiqoTrapReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// THE FIX: Filter events at the source to prevent the controller from processing the cluster's entire event firehose.
+	// Optimize the controller by filtering events at the source. This prevents
+	// the controller from processing the entire cluster event stream, focusing
+	// exclusively on the specific reflection disablement trap condition.
 	liqoTrapFilter := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			evt, ok := e.Object.(*corev1.Event)
@@ -126,7 +133,8 @@ func (r *LiqoTrapReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			}
 			return evt.Reason == "ReflectionDisabled" && evt.InvolvedObject.Kind == "Pod"
 		},
-		// We generally don't care about updates or deletes for this specific trap logic
+		// Ignore update and delete events as this remediation logic is only
+		// triggered by the initial creation of the targeted Event.
 		UpdateFunc: func(e event.UpdateEvent) bool { return false },
 		DeleteFunc: func(e event.DeleteEvent) bool { return false },
 	}

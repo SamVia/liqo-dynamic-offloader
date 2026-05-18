@@ -77,7 +77,7 @@ Create `test/2-demo.sh` with this content:
 
 kubectl config use-context kind-cluster-local >/dev/null 2>&1
 
-echo "📝 Step 1: Generating the Deep Trap Deployment YAML..."
+echo "Step 1: Generating the Deep Trap Deployment YAML..."
 cat <<EOF > /tmp/trap-deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
@@ -104,7 +104,7 @@ spec:
         operator: "Exists"
 EOF
 
-echo "🧹 Cleaning up any previous runs..."
+echo "Cleaning up any previous runs..."
 kubectl delete deployment liqo-trap-deployment -n default --ignore-not-found=true >/dev/null 2>&1
 kubectl delete namespaceoffloading offloading -n default --ignore-not-found=true >/dev/null 2>&1
 
@@ -113,7 +113,7 @@ sleep 2
 echo "👀 Step 2: Starting Telemetry Monitors in the background..."
 echo "---------------------------------------------------------------------"
 
-trap 'echo -e "\n🛑 Demo terminated. Cleaning up background processes..."; kill $(jobs -p) 2>/dev/null; exit' SIGINT SIGTERM
+trap 'echo -e "\n Demo terminated. Cleaning up background processes..."; kill $(jobs -p) 2>/dev/null; exit' SIGINT SIGTERM
 
 # Watch the pods normally so the audience clearly sees the offloading status.
 kubectl get pods -w | grep --line-buffered "liqo-trap" &
@@ -122,7 +122,7 @@ kubectl get events --field-selector involvedObject.kind=Pod --watch-only \
   -o custom-columns="REASON:.reason,MESSAGE:.message" | \
   awk '
     /ReflectionDisabled/ {
-      print "\n\033[1;31m🚨 VIRTUAL KUBELET REJECTION DETECTED 🚨\033[0m"
+      print "\n\033[1;31m VIRTUAL KUBELET REJECTION DETECTED \033[0m"
       print "\033[1;31mReason:\033[0m  ReflectionDisabled"
       print "\033[1;31mMessage:\033[0m " substr($0, index($0, $2)) "\n"
     }
@@ -130,10 +130,10 @@ kubectl get events --field-selector involvedObject.kind=Pod --watch-only \
 
 sleep 2
 
-echo -e "\n⚡ Step 3: Springing the trap (Deploying pod to non-offloaded namespace)..."
+echo -e "\n Step 3: Springing the trap (Deploying pod to non-offloaded namespace)..."
 kubectl apply -f /tmp/trap-deployment.yaml
 
-echo -e "\n⏳ Waiting for the Virtual Kubelet to react (Press CTRL+C to exit demo)...\n"
+echo -e "\nWaiting for the Virtual Kubelet to react (Press CTRL+C to exit demo)...\n"
 
 wait
 ```
@@ -220,23 +220,25 @@ Create `test/controllers/liqo_trap_controller.go` with this content:
 package controllers
 
 import (
-  "context"
-  "time"
+    "context"
+    "time"
 
-  corev1 "k8s.io/api/core/v1"
-  apierrors "k8s.io/apimachinery/pkg/api/errors"
-  metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-  "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-  "k8s.io/apimachinery/pkg/runtime/schema"
-  ctrl "sigs.k8s.io/controller-runtime"
-  "sigs.k8s.io/controller-runtime/pkg/client"
-  "sigs.k8s.io/controller-runtime/pkg/event"
-  "sigs.k8s.io/controller-runtime/pkg/log"
-  "sigs.k8s.io/controller-runtime/pkg/predicate"
+    corev1 "k8s.io/api/core/v1"
+    apierrors "k8s.io/apimachinery/pkg/api/errors"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+    "k8s.io/apimachinery/pkg/runtime/schema"
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+    "sigs.k8s.io/controller-runtime/pkg/event"
+    "sigs.k8s.io/controller-runtime/pkg/log"
+    "sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
+// LiqoTrapReconciler monitors for specific Kubernetes events indicating a pod 
+// scheduling trap due to missing Liqo offloading configurations.
 type LiqoTrapReconciler struct {
-  client.Client
+    client.Client
 }
 
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
@@ -244,101 +246,122 @@ type LiqoTrapReconciler struct {
 // +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;create;update;patch
 
 func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-  logger := log.FromContext(ctx)
+    logger := log.FromContext(ctx)
 
-  var evt corev1.Event
-  if err := r.Get(ctx, req.NamespacedName, &evt); err != nil {
-    return ctrl.Result{}, client.IgnoreNotFound(err)
-  }
+    // Retrieve the specific Event triggering the reconciliation.
+    var evt corev1.Event
+    if err := r.Get(ctx, req.NamespacedName, &evt); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
 
-  namespace := evt.InvolvedObject.Namespace
-  podName := evt.InvolvedObject.Name
+    namespace := evt.InvolvedObject.Namespace
+    podName := evt.InvolvedObject.Name
 
-  if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" || namespace == "crownlabs-system" {
-    return ctrl.Result{}, nil
-  }
+    // Exclude critical system namespaces to avoid inadvertently applying 
+    // offloading policies to core control plane or storage components.
+    if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" || namespace == "crownlabs-system" {
+        return ctrl.Result{}, nil
+    }
 
-  logger.Info("🚨 ERROR DETECTED: Missing NamespaceOffloading! Initiating Auto-Heal...",
-    "namespace", namespace,
-    "pod", podName,
-  )
+    logger.Info("Missing NamespaceOffloading detected for pod. Initiating remediation.",
+        "namespace", namespace,
+        "pod", podName,
+    )
 
-  offloadCR := &unstructured.Unstructured{}
-  offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
-    Group:   "offloading.liqo.io",
-    Version: "v1beta1",
-    Kind:    "NamespaceOffloading",
-  })
-  offloadCR.SetName("offloading")
-  offloadCR.SetNamespace(namespace)
-  offloadCR.Object["spec"] = map[string]interface{}{
-    "namespaceMappingStrategy": "DefaultName",
-    "podOffloadingStrategy":    "LocalAndRemote",
-    "clusterSelector": map[string]interface{}{
-      "nodeSelectorTerms": []interface{}{
-        map[string]interface{}{
-          "matchExpressions": []interface{}{
-            map[string]interface{}{
-              "key":      "liqo.io/remote-cluster-id",
-              "operator": "In",
-              "values":   []interface{}{"cluster-remote"},
+    // Construct the unstructured NamespaceOffloading Custom Resource 
+    // to define the remote execution policy for this namespace.
+    offloadCR := &unstructured.Unstructured{}
+    offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
+        Group:   "offloading.liqo.io",
+        Version: "v1beta1",
+        Kind:    "NamespaceOffloading",
+    })
+    offloadCR.SetName("offloading")
+    offloadCR.SetNamespace(namespace)
+    offloadCR.Object["spec"] = map[string]interface{}{
+        "namespaceMappingStrategy": "DefaultName",
+        "podOffloadingStrategy":    "LocalAndRemote",
+        "clusterSelector": map[string]interface{}{
+            "nodeSelectorTerms": []interface{}{
+                map[string]interface{}{
+                    "matchExpressions": []interface{}{
+                        map[string]interface{}{
+                            "key":      "liqo.io/remote-cluster-id",
+                            "operator": "In",
+                            "values":   []interface{}{"cluster-remote"},
+                        },
+                    },
+                },
             },
-          },
         },
-      },
-    },
-  }
+    }
 
-  err := r.Create(ctx, offloadCR)
-  if err != nil {
-    if apierrors.IsAlreadyExists(err) {
-      logger.Info("⚠️ NamespaceOffloading already exists. Proceeding to pod kick...", "namespace", namespace)
+    // Apply the NamespaceOffloading policy to the target namespace.
+    err := r.Create(ctx, offloadCR)
+    if err != nil {
+        if apierrors.IsAlreadyExists(err) {
+            logger.Info("NamespaceOffloading already exists. Proceeding to delete the trapped pod.", "namespace", namespace)
+        } else {
+            logger.Error(err, "Failed to create NamespaceOffloading policy")
+            return ctrl.Result{}, err
+        }
     } else {
-      logger.Error(err, "❌ Failed to create NamespaceOffloading policy")
-      return ctrl.Result{}, err
-    }
-  } else {
-    logger.Info("✅ SUCCESS: Auto-applied NamespaceOffloading! Requeueing to allow webhook registration...", "namespace", namespace)
-    return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-  }
-
-  var stuckPod corev1.Pod
-  if err := r.Get(ctx, client.ObjectKey{Name: podName, Namespace: namespace}, &stuckPod); err == nil {
-    deletePolicy := metav1.DeletePropagationBackground
-    deleteOpts := &client.DeleteOptions{
-      PropagationPolicy: &deletePolicy,
+        // Requeue the request after creation rather than sleeping. This yields the thread
+        // and provides Liqo's mutating webhooks sufficient time to process the new policy 
+        // before we attempt to delete the pod.
+        logger.Info("Successfully applied NamespaceOffloading. Requeueing to allow webhook registration.", "namespace", namespace)
+        return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
     }
 
-    if err := r.Delete(ctx, &stuckPod, deleteOpts); err != nil {
-      logger.Error(err, "❌ Failed to kick the stuck pod", "pod", podName)
-      return ctrl.Result{}, err
-    }
-    logger.Info("♻️ Kicked the stuck pod. The Deployment/ReplicaSet will now spawn a new one!", "pod", podName)
-  } else if !apierrors.IsNotFound(err) {
-    logger.Error(err, "❌ Failed to fetch the stuck pod for deletion", "pod", podName)
-    return ctrl.Result{}, err
-  }
+    // Delete the trapped pod. This step is reached either if the policy already existed 
+    // or during the requeue following a successful policy creation.
+    var stuckPod corev1.Pod
+    if err := r.Get(ctx, client.ObjectKey{Name: podName, Namespace: namespace}, &stuckPod); err == nil {
 
-  return ctrl.Result{}, nil
+        // Utilize Background deletion propagation to ensure the API server handles 
+        // garbage collection asynchronously, preventing the client from hanging.
+        deletePolicy := metav1.DeletePropagationBackground
+        deleteOpts := &client.DeleteOptions{
+            PropagationPolicy: &deletePolicy,
+        }
+
+        if err := r.Delete(ctx, &stuckPod, deleteOpts); err != nil {
+            logger.Error(err, "Failed to delete the stuck pod", "pod", podName)
+            // Returning the error triggers the controller's backoff retry mechanism.
+            return ctrl.Result{}, err
+        }
+        logger.Info("Successfully deleted the stuck pod. The managing controller (e.g., ReplicaSet) should provision a replacement.", "pod", podName)
+    } else if !apierrors.IsNotFound(err) {
+        logger.Error(err, "Failed to fetch the stuck pod for deletion", "pod", podName)
+        return ctrl.Result{}, err
+    }
+
+    return ctrl.Result{}, nil
 }
 
+// SetupWithManager sets up the controller with the Manager.
 func (r *LiqoTrapReconciler) SetupWithManager(mgr ctrl.Manager) error {
-  liqoTrapFilter := predicate.Funcs{
-    CreateFunc: func(e event.CreateEvent) bool {
-      evt, ok := e.Object.(*corev1.Event)
-      if !ok {
-        return false
-      }
-      return evt.Reason == "ReflectionDisabled" && evt.InvolvedObject.Kind == "Pod"
-    },
-    UpdateFunc: func(e event.UpdateEvent) bool { return false },
-    DeleteFunc: func(e event.DeleteEvent) bool { return false },
-  }
+    // Optimize the controller by filtering events at the source. This prevents 
+    // the controller from processing the entire cluster event stream, focusing 
+    // exclusively on the specific reflection disablement trap condition.
+    liqoTrapFilter := predicate.Funcs{
+        CreateFunc: func(e event.CreateEvent) bool {
+            evt, ok := e.Object.(*corev1.Event)
+            if !ok {
+                return false
+            }
+            return evt.Reason == "ReflectionDisabled" && evt.InvolvedObject.Kind == "Pod"
+        },
+        // Ignore update and delete events as this remediation logic is only 
+        // triggered by the initial creation of the targeted Event.
+        UpdateFunc: func(e event.UpdateEvent) bool { return false },
+        DeleteFunc: func(e event.DeleteEvent) bool { return false },
+    }
 
-  return ctrl.NewControllerManagedBy(mgr).
-    For(&corev1.Event{}).
-    WithEventFilter(liqoTrapFilter).
-    Complete(r)
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&corev1.Event{}).
+        WithEventFilter(liqoTrapFilter).
+        Complete(r)
 }
 ```
 
@@ -350,96 +373,115 @@ Create `test/controllers/liqo_cleanup_controller.go` with this content:
 package controllers
 
 import (
-  "context"
+    "context"
 
-  corev1 "k8s.io/api/core/v1"
-  "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-  "k8s.io/apimachinery/pkg/runtime/schema"
-  ctrl "sigs.k8s.io/controller-runtime"
-  "sigs.k8s.io/controller-runtime/pkg/client"
-  "sigs.k8s.io/controller-runtime/pkg/event"
-  "sigs.k8s.io/controller-runtime/pkg/log"
-  "sigs.k8s.io/controller-runtime/pkg/predicate"
+    corev1 "k8s.io/api/core/v1"
+    "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+    "k8s.io/apimachinery/pkg/runtime/schema"
+    ctrl "sigs.k8s.io/controller-runtime"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+    "sigs.k8s.io/controller-runtime/pkg/event"
+    "sigs.k8s.io/controller-runtime/pkg/log"
+    "sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
 type LiqoCleanupReconciler struct {
-  client.Client
+    client.Client
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;delete
 
 func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-  logger := log.FromContext(ctx)
-  namespace := req.Namespace
+    logger := log.FromContext(ctx)
+    namespace := req.Namespace
 
-  if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" || namespace == "crownlabs-system" {
-    return ctrl.Result{}, nil
-  }
-
-  offloadCR := &unstructured.Unstructured{}
-  offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
-    Group:   "offloading.liqo.io",
-    Version: "v1beta1",
-    Kind:    "NamespaceOffloading",
-  })
-
-  if err := r.Get(ctx, client.ObjectKey{Name: "offloading", Namespace: namespace}, offloadCR); err != nil {
-    return ctrl.Result{}, client.IgnoreNotFound(err)
-  }
-
-  var podList corev1.PodList
-  if err := r.List(ctx, &podList, client.InNamespace(namespace)); err != nil {
-    logger.Error(err, "Failed to list pods in namespace")
-    return ctrl.Result{}, err
-  }
-
-  activeOffloadedPods := 0
-  for _, pod := range podList.Items {
-    if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-      continue
+    // Exclude system and critical namespaces to prevent accidental deletion of their offloading configurations.
+    if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" || namespace == "crownlabs-system" {
+        return ctrl.Result{}, nil
     }
 
-    explicitTarget := pod.Spec.NodeSelector != nil && pod.Spec.NodeSelector["kubernetes.io/hostname"] == "cluster-remote"
-    scheduledRemote := pod.Spec.NodeName == "cluster-remote"
-    isPendingRemote := pod.Status.Phase == corev1.PodPending && pod.Spec.NodeName == "" && explicitTarget
+    // Verify if a NamespaceOffloading resource exists for the current namespace.
+    offloadCR := &unstructured.Unstructured{}
+    offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
+        Group:   "offloading.liqo.io",
+        Version: "v1beta1",
+        Kind:    "NamespaceOffloading",
+    })
 
-    if explicitTarget || scheduledRemote || isPendingRemote {
-      activeOffloadedPods++
+    if err := r.Get(ctx, client.ObjectKey{Name: "offloading", Namespace: namespace}, offloadCR); err != nil {
+        // If the resource is not found, the cleanup is already complete.
+        return ctrl.Result{}, client.IgnoreNotFound(err)
     }
-  }
 
-  if activeOffloadedPods == 0 {
-    if offloadCR.GetUID() != "" {
-      logger.Info("🧹 ZERO active remote pods remain. Initiating lockdown...", "namespace", namespace)
-      if err := r.Delete(ctx, offloadCR); client.IgnoreNotFound(err) != nil {
-        logger.Error(err, "❌ Failed to delete NamespaceOffloading")
+    // Retrieve all Pods within the namespace to evaluate their current scheduling and execution status.
+    var podList corev1.PodList
+    if err := r.List(ctx, &podList, client.InNamespace(namespace)); err != nil {
+        logger.Error(err, "Failed to list pods in namespace")
         return ctrl.Result{}, err
-      }
-      logger.Info("🔒 SUCCESS: NamespaceOffloading destroyed. Namespace is strictly isolated again.", "namespace", namespace)
     }
-  }
-  return ctrl.Result{}, nil
+
+    // Calculate the number of active Pods that rely on the remote cluster.
+    activeOffloadedPods := 0
+    for _, pod := range podList.Items {
+        // Exclude pods that have reached a terminal state.
+        if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+            continue
+        }
+
+        // Condition A: The pod explicitly requests scheduling on the remote cluster via NodeSelector.
+        explicitTarget := pod.Spec.NodeSelector != nil && pod.Spec.NodeSelector["kubernetes.io/hostname"] == "cluster-remote"
+
+        // Condition B: The pod has already been scheduled and is running on the remote node.
+        scheduledRemote := pod.Spec.NodeName == "cluster-remote"
+
+        // Condition C: The pod is pending scheduling specifically for the remote cluster.
+        // This ensures we do not block cleanup for pending pods intended for local nodes.
+        isPendingRemote := pod.Status.Phase == corev1.PodPending && pod.Spec.NodeName == "" && explicitTarget
+
+        if explicitTarget || scheduledRemote || isPendingRemote {
+            activeOffloadedPods++
+        }
+    }   
+
+    // If no active remote pods remain, proceed to revoke the offloading configuration.
+    if activeOffloadedPods == 0 {
+        // Confirm the resource was successfully fetched before attempting deletion.
+        if offloadCR.GetUID() != "" {
+            logger.Info("Zero active remote pods remain. Initiating offload cleanup.", "namespace", namespace)
+            
+            if err := r.Delete(ctx, offloadCR); client.IgnoreNotFound(err) != nil {
+                logger.Error(err, "Failed to delete NamespaceOffloading")
+                return ctrl.Result{}, err
+            }
+            logger.Info("Successfully deleted NamespaceOffloading. Namespace isolation restored.", "namespace", namespace)
+        }
+    }
+    return ctrl.Result{}, nil
 }
 
 func (r *LiqoCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
-  podStateChangePredicate := predicate.Funcs{
-    CreateFunc: func(e event.CreateEvent) bool { return true },
-    DeleteFunc: func(e event.DeleteEvent) bool { return true },
-    UpdateFunc: func(e event.UpdateEvent) bool {
-      oldPod, okOld := e.ObjectOld.(*corev1.Pod)
-      newPod, okNew := e.ObjectNew.(*corev1.Pod)
-      if !okOld || !okNew {
-        return false
-      }
-      return oldPod.Status.Phase != newPod.Status.Phase || oldPod.Spec.NodeName != newPod.Spec.NodeName
-    },
-  }
+    // Optimize the controller by filtering events to reduce unnecessary Reconcile calls.
+    // We only trigger reconciliation when pod state changes affect our remote counting logic.
+    podStateChangePredicate := predicate.Funcs{
+        CreateFunc: func(e event.CreateEvent) bool { return true },
+        DeleteFunc: func(e event.DeleteEvent) bool { return true },
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            oldPod, okOld := e.ObjectOld.(*corev1.Pod)
+            newPod, okNew := e.ObjectNew.(*corev1.Pod)
+            if !okOld || !okNew {
+                return false
+            }
+            // Trigger reconciliation only if the Pod's Phase or assigned Node changes.
+            // This safely ignores updates to annotations, labels, or readiness probes.
+            return oldPod.Status.Phase != newPod.Status.Phase || oldPod.Spec.NodeName != newPod.Spec.NodeName
+        },
+    }
 
-  return ctrl.NewControllerManagedBy(mgr).
-    For(&corev1.Pod{}).
-    WithEventFilter(podStateChangePredicate).
-    Complete(r)
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&corev1.Pod{}).
+        WithEventFilter(podStateChangePredicate).
+        Complete(r)
 }
 ```
 
