@@ -120,12 +120,12 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return ctrl.Result{}, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
-func (r *LiqoTrapReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Optimize the controller by filtering events at the source. This prevents
-	// the controller from processing the entire cluster event stream, focusing
-	// exclusively on the specific reflection disablement trap condition.
-	liqoTrapFilter := predicate.Funcs{
+// LiqoTrapPredicate optimizes the controller by filtering events at the source.
+// This prevents the controller from processing the entire cluster event stream,
+// focusing exclusively on the specific reflection disablement trap condition.
+// Exposed publicly to allow for unit testing.
+func LiqoTrapPredicate() predicate.Predicate {
+	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			evt, ok := e.Object.(*corev1.Event)
 			if !ok {
@@ -138,9 +138,12 @@ func (r *LiqoTrapReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		UpdateFunc: func(e event.UpdateEvent) bool { return false },
 		DeleteFunc: func(e event.DeleteEvent) bool { return false },
 	}
+}
 
+// SetupWithManager sets up the controller with the Manager.
+func (r *LiqoTrapReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Event{}).
-		WithEventFilter(liqoTrapFilter).
+		WithEventFilter(LiqoTrapPredicate()). // Uses the extracted predicate
 		Complete(r)
 }

@@ -88,10 +88,11 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{}, nil
 }
 
-func (r *LiqoCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	// Optimize the controller by filtering events to reduce unnecessary Reconcile calls.
-	// We only trigger reconciliation when pod state changes affect our remote counting logic.
-	podStateChangePredicate := predicate.Funcs{
+// LiqoCleanupPredicate optimizes the controller by filtering events to reduce unnecessary Reconcile calls.
+// We only trigger reconciliation when pod state changes affect our remote counting logic.
+// Exposed publicly to allow for unit testing.
+func LiqoCleanupPredicate() predicate.Predicate {
+	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool { return true },
 		DeleteFunc: func(e event.DeleteEvent) bool { return true },
 		UpdateFunc: func(e event.UpdateEvent) bool {
@@ -105,9 +106,12 @@ func (r *LiqoCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			return oldPod.Status.Phase != newPod.Status.Phase || oldPod.Spec.NodeName != newPod.Spec.NodeName
 		},
 	}
+}
 
+// SetupWithManager sets up the controller with the Manager.
+func (r *LiqoCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
-		WithEventFilter(podStateChangePredicate).
+		WithEventFilter(LiqoCleanupPredicate()). // Uses the extracted predicate
 		Complete(r)
 }
