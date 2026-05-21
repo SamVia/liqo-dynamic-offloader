@@ -30,6 +30,15 @@ Vedrai dei log di avvio e poi si fermerà in attesa. Lascia questo terminale ape
 Ora andiamo a creare il "problema" nel cluster. Applicheremo un Pod configurato per essere schedulato sul nodo remoto di Liqo, ma all'interno di un namespace (`test-liqo`) che **non** è stato esportato. Liqo rifiuterà il Pod mettendolo in stato di `OffloadingBackOff`.
 
 Apri il **Terminale 2** ed esegui:
+Prima controllare in quale cluster sto lavorando:
+```bash
+kubectl config get-contexts
+```
+Se mi trovo su un cluster diverso da `kind-cluster-local`:
+```bash
+kubectl config use-context kind-cluster-local
+```
+e poi:
 ```bash
 kubectl apply -f manifest.yaml
 ```
