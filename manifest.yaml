@@ -6,20 +6,29 @@ metadata:
     # Questa è la label di whitelisting per il tuo controller
     liqo-helper.io/monitor: "true"
 ---
-apiVersion: v1
-kind: Pod
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: test-pod
+  name: test-deploy
   namespace: test-liqo
 spec:
-  containers:
-  - name: my-container
-    image: nginx
-  # Forziamo il Pod sul nodo virtuale di Liqo
-  nodeSelector:
-    liqo.io/type: virtual-node
-  # Tolleriamo il taint di default del virtual node di Liqo
-  tolerations:
-  - key: "virtual-node.liqo.io/not-allowed"
-    operator: "Exists"
-    effect: "NoExecute"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-app
+  template:
+    metadata:
+      labels:
+        app: test-app
+    spec:
+      containers:
+      - name: my-container
+        image: nginx
+      # Forziamo il Pod sul nodo virtuale di Liqo
+      nodeSelector:
+        liqo.io/type: virtual-node
+      # Tolleriamo il taint di default del virtual node di Liqo
+      tolerations:
+      - key: "virtual-node.liqo.io/not-allowed"
+        operator: "Exists"
+        effect: "NoExecute"
