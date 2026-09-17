@@ -3,7 +3,7 @@ set -e
 
 echo -e "\033[1;36m=== In-Cluster Operator Demo ===\033[0m"
 
-TARGET_CLUSTERS="${TARGET_CLUSTER_ID-}"
+TARGET_CLUSTERS="${TARGET_CLUSTER_ID:-cluster-remote}"
 DEMO_REMOTE_CLUSTER="${DEMO_REMOTE_CLUSTER:-cluster-remote}"
 DEMO_EXCLUDED_NAMESPACE="${DEMO_EXCLUDED_NAMESPACE:-demo-not-selected}"
 EXCLUDED_NAMESPACES="${EXCLUDED_NAMESPACES:-kube-system,liqo-system,local-path-storage,crownlabs-system},${DEMO_EXCLUDED_NAMESPACE}"
@@ -13,8 +13,8 @@ echo "Demo virtual node: ${DEMO_REMOTE_CLUSTER}"
 
 kubectl config use-context kind-cluster-local >/dev/null 2>&1
 
-echo "1. Loading the Docker image into the local Kind cluster..."
-kind load docker-image liqo-dynamic-offloader:latest --name cluster-local
+echo "1. Skipping local image load (Configured to pull from GHCR)..."
+# kind load docker-image liqo-dynamic-offloader:latest --name cluster-local
 
 echo "2. Deploying the Operator (RBAC + Deployment)..."
 kubectl apply -f config/rbac/role.yaml
@@ -57,15 +57,17 @@ spec:
       serviceAccountName: liqo-auto-healing-sa
       containers:
       - name: manager
-        image: liqo-dynamic-offloader:latest
-        imagePullPolicy: IfNotPresent
+        # Point directly to the GHCR public registry
+        image: ghcr.io/samvia/liqo-dynamic-offloader:latest
+        # Force Kubernetes to download it instead of using local cache
+        imagePullPolicy: Always
         env:
         - name: TARGET_CLUSTER_ID
           value: "${TARGET_CLUSTERS}"
         - name: EXCLUDED_NAMESPACES
           value: "${EXCLUDED_NAMESPACES}"
         - name: TRAP_BACKOFF
-          value: "2s"
+          value: "10s"
         - name: CLEANUP_GRACE_PERIOD
           value: "10s"
 EOF
@@ -146,8 +148,8 @@ kubectl apply -f /tmp/non-selected-deployment.yaml
 echo "Checking that the excluded namespace is not offloaded..."
 sleep 5
 if kubectl get namespaceoffloading offloading -n "${DEMO_EXCLUDED_NAMESPACE}" >/dev/null 2>&1; then
-	echo "ERROR: an offloading policy was created for ${DEMO_EXCLUDED_NAMESPACE}"
-	exit 1
+  echo "ERROR: an offloading policy was created for ${DEMO_EXCLUDED_NAMESPACE}"
+  exit 1
 fi
 echo "OK: ${DEMO_EXCLUDED_NAMESPACE} has no NamespaceOffloading policy."
 
