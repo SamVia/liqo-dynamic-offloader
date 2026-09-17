@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../assets/logo.png" width="150" alt="Liqo Dynamic Offloader Logo">
+</p>
+
 # liqo-dynamic-offloader
 *Leggi in altre lingue: [English](../README.md)*
 
