@@ -1,5 +1,9 @@
 # Liqo Strict Isolation & Custom Controller Demo
 
+> The runnable scripts for this repository are in `scripts/`. Run commands
+> from the repository root with Bash, Git Bash, or WSL. The examples below
+> explain the demo phases; use the checked-in scripts when running them.
+
 This demo proves the core security boundaries of [Liqo](https://liqo.io/), a multi-cluster networking and offloading mesh.
 
 Specifically, it demonstrates that **peering is not enough** to allow cross-cluster execution. By forcefully bypassing the Kube-scheduler, we prove that Liqo's Virtual Kubelet acts as a hard security boundary, actively rejecting workloads unless a namespace is explicitly authorized via a `NamespaceOffloading` policy. Finally, we build a custom Kubernetes Operator in Go to detect this exact security rejection in real-time.
@@ -18,7 +22,9 @@ Ensure you have the following installed on your machine:
 
 ## Phase 1: Infrastructure Setup
 
-Create a file named `1-setup.sh`. This script will spin up two local Kind clusters, install the Liqo control plane, and peer them together securely using a NodePort gateway.
+Use [`scripts/1-setup.sh`](../scripts/1-setup.sh) to spin up two local Kind
+clusters, install the Liqo control plane, and peer them together securely
+using a NodePort gateway.
 
 ```bash
 #!/bin/bash
@@ -54,8 +60,8 @@ kubectl get nodes --context kind-cluster-local
 Make it executable and run it:
 
 ```bash
-chmod +x 1-setup.sh
-./1-setup.sh
+chmod +x scripts/1-setup.sh
+./scripts/1-setup.sh
 
 ```
 
@@ -63,7 +69,11 @@ chmod +x 1-setup.sh
 
 ## Phase 2: The Trap & Telemetry
 
-Create a file named `2-demo.sh`. This script generates a Pod that attempts to bypass the Kube-scheduler using a specific toleration, forcing it into the Virtual Kubelet's domain. It also spins up background monitors to catch the precise moment the Virtual Kubelet rejects it.
+Use [`scripts/2-demo.sh`](../scripts/2-demo.sh). This script generates a
+Deployment that attempts to bypass the Kube-scheduler using a specific
+toleration, forcing it into the Virtual Kubelet's domain. It also starts
+background monitors to catch the precise moment the Virtual Kubelet rejects
+it.
 
 ```bash
 #!/bin/bash
@@ -131,7 +141,7 @@ wait
 
 ```
 
-Make it executable: `chmod +x 2-demo.sh` *(Do not run it just yet).*
+Make it executable with `chmod +x scripts/2-demo.sh` *(do not run it just yet).* 
 
 ---
 
@@ -281,7 +291,7 @@ go run main.go
 Execute your telemetry and deployment script.
 
 ```bash
-./2-demo.sh
+./scripts/2-demo.sh
 
 ```
 

@@ -1,6 +1,9 @@
 # Liqo Strict Isolation & Advanced Auto-Healing Demo
 
-This advanced demo extends the base security proof with a full auto-healing controller pair from the `test` folder.
+This advanced demo extends the base security proof with the auto-healing
+controller pair in this repository's `controllers/` directory. The runnable
+scripts are in `scripts/`; run commands from the repository root with Bash,
+Git Bash, or WSL.
 
 It shows that Liqo still enforces strict namespace isolation, then builds a controller that:
 
@@ -23,9 +26,10 @@ Ensure you have the following installed on your machine:
 
 ## Phase 1: Infrastructure Setup
 
-Use `test/1-setup.sh` to create two local Kind clusters, install Liqo in both, and peer them with a NodePort gateway.
+Use [`scripts/1-setup.sh`](../scripts/1-setup.sh) to create two local Kind
+clusters, install Liqo in both, and peer them with a NodePort gateway.
 
-Create `test/1-setup.sh` with the following content:
+For reference, the setup script contains:
 
 ```bash
 #!/bin/bash
@@ -60,17 +64,19 @@ kubectl get nodes --context kind-cluster-local
 Make it executable and run it:
 
 ```bash
-chmod +x test/1-setup.sh
-./test/1-setup.sh
+chmod +x scripts/1-setup.sh
+./scripts/1-setup.sh
 ```
 
 ---
 
 ## Phase 2: The Advanced Trap Demo
 
-The advanced demo now deploys a `Deployment` rather than a raw `Pod` and monitors Liqo events while the deployment attempts to use the remote virtual node.
+The advanced demo deploys a `Deployment` rather than a raw `Pod` and monitors
+Liqo events while the deployment attempts to use the remote virtual node. Use
+[`scripts/2-demo.sh`](../scripts/2-demo.sh) for the checked-in version.
 
-Create `test/2-demo.sh` with this content:
+For reference, the trap script contains:
 
 ```bash
 #!/bin/bash
@@ -141,14 +147,15 @@ wait
 Make it executable:
 
 ```bash
-chmod +x test/2-demo.sh
+chmod +x scripts/2-demo.sh
 ```
 
 ---
 
 ## Phase 3: Build the Advanced Go Operator
 
-The new `test` folder includes a two-controller operator that:
+The repository includes a two-controller operator in `main.go` and
+`controllers/` that:
 
 - detects Liqo rejection events,
 - auto-applies `NamespaceOffloading`,
@@ -157,7 +164,7 @@ The new `test` folder includes a two-controller operator that:
 
 ### 3.1 Initialize the project
 
-From `test/`:
+From the repository root:
 
 ```bash
 go mod init liqo-demo/operator
@@ -165,7 +172,7 @@ go mod init liqo-demo/operator
 
 ### 3.2 `main.go`
 
-Create `test/main.go` with this content:
+The repository's `main.go` starts both reconcilers:
 
 ```go
 package main
@@ -214,7 +221,7 @@ func main() {
 
 ### 3.3 `controllers/liqo_trap_controller.go`
 
-Create `test/controllers/liqo_trap_controller.go` with this content:
+The trap reconciler is implemented in `controllers/liqo_trap_controller.go`:
 
 ```go
 package controllers
@@ -367,7 +374,7 @@ func (r *LiqoTrapReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 ### 3.4 `controllers/liqo_cleanup_controller.go`
 
-Create `test/controllers/liqo_cleanup_controller.go` with this content:
+The cleanup reconciler is implemented in `controllers/liqo_cleanup_controller.go`:
 
 ```go
 package controllers
@@ -489,17 +496,16 @@ func (r *LiqoCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 ## Phase 4: Run the Advanced Demo
 
-1. Start the operator from the `test/` directory:
+1. Start the operator from the repository root:
 
 ```bash
-cd test
 go run .
 ```
 
 2. In another shell, run the advanced trap demo:
 
 ```bash
-./test/2-demo.sh
+./scripts/2-demo.sh
 ```
 
 You should see:
@@ -513,11 +519,14 @@ You should see:
 
 ## Optional Reset
 
-Use `test/0-reset.sh` to clean the demo state and restore strict isolation for the `default` namespace:
+Use [`scripts/0-reset.sh`](../scripts/0-reset.sh) to clean the demo state and restore strict isolation for the `default` namespace:
 
 ```bash
-chmod +x test/0-reset.sh
-./test/0-reset.sh
+chmod +x scripts/0-reset.sh
+./scripts/0-reset.sh
 ```
 
-This advanced demo file now incorporates the full `test/` folder workflow: the improved setup scripts, the trap deployment, the real-time rejection telemetry, and the auto-healing Go operator with cleanup logic.
+This advanced demo file covers the setup scripts, the trap deployment, the
+real-time rejection telemetry, and the auto-healing Go operator with cleanup
+logic. See [`demo_complete.md`](demo_complete.md) for the image-based
+in-cluster workflow driven by `scripts/3-demo-complete.sh`.

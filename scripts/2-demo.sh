@@ -40,7 +40,7 @@ echo "---------------------------------------------------------------------"
 
 trap 'echo -e "\n Demo terminated. Cleaning up background processes..."; kill $(jobs -p) 2>/dev/null; exit' SIGINT SIGTERM
 
-# Watch the pods normally so the audience clearly sees the 'OffloadingBackOff' status!
+# Watch the pods normally to show OffloadingBackOff
 kubectl get pods -w | grep --line-buffered "liqo-trap" &
 
 kubectl get events --field-selector involvedObject.kind=Pod --watch-only \
