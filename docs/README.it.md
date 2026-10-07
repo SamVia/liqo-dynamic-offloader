@@ -17,9 +17,9 @@ Liqo mantiene i namespace isolati finché non esiste una risorsa `NamespaceOfflo
 
 1. intercetta la creazione o l'aggiornamento di un pod in `OffloadingBackOff`;
 2. crea la risorsa `NamespaceOffloading` con il cluster remoto configurato;
-3. elimina il pod bloccato, lasciando al relativo controller Kubernetes il compito di ricrearlo;
+3. applica l'annotazione `dynamic-offloader.liqo.io/force-sync` al pod bloccato, richiedendo una nuova sincronizzazione senza eliminarlo;
 4. osserva il ciclo di vita dei pod remoti;
-5. revoca la policy quando non rimangono pod remoti attivi, ripristinando l'isolamento del namespace.
+5. avvia un conto alla rovescia persistente quando non rimangono pod remoti attivi e revoca la policy dopo il ritardo configurato.
 
 ## Architettura
 
@@ -34,38 +34,41 @@ Quando rileva il trap, ignora i namespace esclusi e i pod già in terminazione. 
 - crea `NamespaceOffloading/offloading` nel namespace del pod;
 - configura `namespaceMappingStrategy: DefaultName`;
 - usa `podOffloadingStrategy: LocalAndRemote`;
-- vincola l'offloading tramite l'etichetta `liqo.io/remote-cluster-id` se in `TARGET_CLUSTER_ID` sono specificati dei cluster, altrimenti lascia la configurazione aperta per delegare il bilanciamento a Liqo;
-- attende il periodo `TRAP_BACKOFF`, lasciando il tempo ai webhook Liqo di registrare la nuova policy;
-- rilegge il pod dopo l'attesa e lo elimina con propagazione background solo se è ancora in `OffloadingBackOff`.
+- vincola l'offloading tramite l'etichetta `liqo.io/remote-cluster-id` se i cluster sono specificati con `--target-cluster-ids`, altrimenti delega la scelta a Liqo;
+- attende il periodo `--trap-backoff`, lasciando il tempo alla logica asincrona di ammissione e schedulazione di Liqo di elaborare la nuova policy;
+- rilegge il pod dopo l'attesa e applica l'annotazione `force-sync` solo se è ancora in `OffloadingBackOff`.
 
-Se la policy esiste già, il controller rispetta il cooldown `TRAP_BACKOFF` dell'ultima remediation prima di procedere. Se Liqo ha già recuperato il pod durante il backoff, la cancellazione viene evitata. In caso contrario, il Deployment, ReplicaSet o altro workload controller può creare una nuova istanza dopo l'applicazione della policy.
+Se la policy esiste già, il controller rispetta il cooldown della remediation a livello di namespace prima di procedere. Se Liqo ha già recuperato il pod durante il backoff, non viene eseguita alcuna modifica. In modalità dry-run vengono registrate le azioni previste senza creare o aggiornare risorse.
 
 ### Cleanup Controller
 Il **Cleanup Controller** osserva i pod e riconcilia solo i cambiamenti rilevanti per il conteggio dei workload remoti: creazione, eliminazione, cambio di fase, assegnazione del nodo o ingresso nel graceful shutdown.
 
-Prima di contare i pod, il controller verifica l'età della `NamespaceOffloading`. Una policy appena creata non viene rimossa: il reconcile viene riprogrammato dopo il periodo `CLEANUP_GRACE_PERIOD`, così Liqo e il Trap Controller possono completare lo sblocco e la schedulazione.
-
-Trascorso il periodo di grazia, per ogni namespace con una `NamespaceOffloading` considera attivi i pod che:
+Per ogni namespace con una `NamespaceOffloading` considera attivi i pod che:
 
 - sono assegnati al cluster remoto;
 - richiedono il cluster remoto tramite `kubernetes.io/hostname`;
 - sono ancora `Pending` ma destinati al cluster remoto;
 - stanno terminando, anche se la cancellazione è già iniziata.
 
-La policy viene eliminata soltanto quando il conteggio scende a zero. In questo modo il **Graceful Shutdown** viene rispettato: un pod in terminazione continua a mantenere l'offloading finché non è effettivamente uscito dal workload. Al completamento della pulizia il controller genera anche l'evento Kubernetes normal `Successful Cleanup`.
+Quando il conteggio scende a zero, il controller salva un timestamp `empty-since` e riprogramma la riconciliazione dopo `--cleanup-delay`. Se durante il conto alla rovescia compaiono nuovi workload remoti, il timestamp viene rimosso. Allo scadere del ritardo la policy viene eliminata. In questo modo il **Graceful Shutdown** viene rispettato: un pod in terminazione continua a mantenere l'offloading finché non è effettivamente uscito dal workload. Al completamento della pulizia il controller genera anche l'evento Kubernetes normal `Successful Cleanup`.
 
 ## Features
 
 ### Configurazione dinamica
 
-L'operatore non hardcoda l'identificativo del cluster remoto né l'elenco dei namespace protetti. La configurazione viene letta all'avvio:
+L'operatore viene configurato all'avvio tramite flag della riga di comando. Il chart Helm mappa i valori sotto `config` su questi flag:
 
-| Variabile | Descrizione | Default |
+| Flag | Descrizione | Default |
 | --- | --- | --- |
-| `TARGET_CLUSTER_ID` | Elenco separato da virgole degli ID Liqo dei cluster verso cui abilitare l'offloading. Se lasciato vuoto, la scelta del cluster viene delegata allo scheduler di Liqo. | *(vuoto)* |
-| `EXCLUDED_NAMESPACES` | Elenco separato da virgole dei namespace da ignorare. Gli spazi vengono rimossi. | `kube-system,liqo-system,local-path-storage,crownlabs-system` |
-| `TRAP_BACKOFF` | Durata dell'attesa dopo la creazione della policy e prima del ricontrollo del pod bloccato. | `2s` |
-| `CLEANUP_GRACE_PERIOD` | Età minima della policy prima che il Cleanup Controller possa valutarne la revoca. | `10s` |
+| `--target-cluster-ids` | Elenco separato da virgole degli ID Liqo. Se vuoto, la scelta viene delegata a Liqo. | *(vuoto)* |
+| `--excluded-namespaces` | Namespace da ignorare, separati da virgole. Supporta pattern glob come `*-system`. | `kube-system,liqo-system` |
+| `--trap-whitelist-labels` | Label `key=value` richieste sul namespace per abilitare il Trap Controller. | *(vuoto)* |
+| `--trap-blacklist-labels` | Label `key=value` che disabilitano il Trap Controller sul namespace. | *(vuoto)* |
+| `--cleanup-whitelist-labels` | Label `key=value` richieste sul namespace per abilitare il Cleanup Controller. | *(vuoto)* |
+| `--cleanup-blacklist-labels` | Label `key=value` che disabilitano il Cleanup Controller sul namespace. | *(vuoto)* |
+| `--trap-backoff` | Durata dell'attesa prima di ricontrollare un pod bloccato. | `2s` |
+| `--cleanup-delay` | Conto alla rovescia prima di eliminare una policy vuota. `0` disabilita la pulizia automatica. | `10s` |
+| `--dry-run` | Registra le azioni previste senza modificare lo stato del cluster. | `false` |
 
 ### High Availability
 
@@ -122,22 +125,72 @@ In un secondo terminale, lanciare lo script di demo interattivo:
 ./scripts/2-demo.sh
 ```
 
-## Demo 2: Produzione In-Cluster (Docker)
+## Demo 2: Produzione In-Cluster (Helm)
 
-Per testare l'operatore esattamente come girerebbe in un ambiente reale (es. CrownLabs), puoi buildare l'immagine e iniettarla nel cluster con un singolo script che si occupa anche di applicare i manifest RBAC e il Deployment:
+Per testare l'operatore in un ambiente reale, il chart Helm viene installato
+utilizzando di default l'immagine remota GHCR:
 
 ```bash
-make docker-build
 ./scripts/3-demo-complete.sh
 ```
 
-Lo script configurerà i permessi (inclusa la Leader Election), avvierà il Pod dell'operatore, creerà la "trappola" per Liqo e mostrerà i log in streaming del recupero automatico.
+Lo script continua a scaricare l'immagine
+`ghcr.io/samvia/liqo-dynamic-offloader:latest` usando
+`imagePullPolicy: Always`. È possibile sovrascrivere l'immagine senza
+modificare lo script:
+
+```bash
+IMAGE_TAG=0.1.0 IMAGE_PULL_POLICY=IfNotPresent ./scripts/3-demo-complete.sh
+```
+
+Lo script installa o aggiorna la release Helm, configura i flag del controller,
+crea namespace e workload di test e mostra i log dell'operatore.
 
 Per ripristinare esplicitamente lo scenario iniziale:
 
 ```bash
 ./scripts/0-reset.sh
 ```
+
+## Deployment Helm
+
+Il metodo consigliato per gli ambienti di produzione è il chart Helm in
+`charts/liqo-dynamic-offloader`. Il chart crea il Deployment dell'operatore,
+il ServiceAccount, il ClusterRole e il ClusterRoleBinding.
+
+Per validare e renderizzare il chart:
+
+```bash
+helm lint charts/liqo-dynamic-offloader
+helm template liqo-dynamic-offloader charts/liqo-dynamic-offloader \
+  --namespace liqo-system
+```
+
+Per installare o aggiornare l'operatore:
+
+```bash
+helm upgrade --install liqo-dynamic-offloader \
+  charts/liqo-dynamic-offloader \
+  --namespace liqo-system \
+  --create-namespace \
+  --set image.tag=0.1.0 \
+  --set config.targetClusterIDs=cluster-remote
+```
+
+Per configurare i filtri basati sulle label, usare valori stringa:
+
+```bash
+helm upgrade --install liqo-dynamic-offloader \
+  charts/liqo-dynamic-offloader \
+  --namespace liqo-system \
+  --create-namespace \
+  --set-string config.trapBlacklistLabels=dynamic-offloader.liqo.io/ignore-trap=true \
+  --set-string config.cleanupBlacklistLabels=dynamic-offloader.liqo.io/ignore-cleanup=true
+```
+
+Il supporto webhook è riservato a una versione futura ed è disabilitato.
+Il controller attuale non espone endpoint, Service o integrazione con
+certificati; mantenere `webhook.enabled` impostato su `false`.
 
 ## Test automatici
 
@@ -190,46 +243,6 @@ Se desideri utilizzare l'operatore senza compilarlo dal codice sorgente, puoi re
         image: ghcr.io/samvia/liqo-dynamic-offloader:latest
 ```
 
-### Esempio di Deployment con Variabili d'Ambiente
-
-Quando si distribuisce l'operatore in un cluster reale, è possibile iniettare la configurazione dinamica direttamente nelle specifiche del container utilizzando l'array `env`.
-
-Ecco un esempio completo di un manifest Deployment Kubernetes che utilizza l'immagine GHCR e imposta le variabili di configurazione:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: liqo-dynamic-offloader
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: liqo-dynamic-offloader
-  template:
-    metadata:
-      labels:
-        app: liqo-dynamic-offloader
-    spec:
-      containers:
-      - name: manager
-        image: ghcr.io/samvia/liqo-dynamic-offloader:latest
-        imagePullPolicy: Always
-        env:
-        # 1. Cluster di destinazione (separati da virgola). Lasciare vuoto per delegare il bilanciamento a Liqo.
-        - name: TARGET_CLUSTER_ID
-          value: "cluster-remote-1"
-        # 2. Namespace protetti che l'operatore non toccherà mai
-        - name: EXCLUDED_NAMESPACES
-          value: "kube-system,liqo-system,local-path-storage,crownlabs-system,my-custom-ns"
-        # 3. Timeout e periodi di grazia
-        - name: TRAP_BACKOFF
-          value: "2s"
-        - name: CLEANUP_GRACE_PERIOD
-          value: "10s"
-```
-
 ## Struttura del repository
 
 ```text
@@ -240,6 +253,8 @@ spec:
 ├── go.mod
 ├── go.sum
 ├── main.go
+├── charts/
+│   └── liqo-dynamic-offloader/
 ├── controllers/
 │   ├── liqo_cleanup_controller.go
 │   ├── liqo_cleanup_controller_test.go
@@ -258,7 +273,8 @@ spec:
     ├── 0-reset.sh
     ├── 1-setup.sh
     ├── 2-demo.sh
-    └── 3-demo-complete.sh
+    ├── 3-demo-complete.sh
+    └── 4-locale.sh
 ```
 
 I documenti all'interno di `docs/` approfondiscono i dettagli tecnici architetturali e i log di collaudo avanzati raccolti durante lo sviluppo.
@@ -266,7 +282,7 @@ I documenti all'interno di `docs/` approfondiscono i dettagli tecnici architettu
 ## Sicurezza e comportamento operativo
 
 * I namespace di sistema esclusi non vengono modificati dall'operatore.
-* Il Trap Controller non entra in hot-loop sui pod già in terminazione e non elimina un pod che Liqo ha già recuperato durante il backoff.
+* Il Trap Controller non entra in hot-loop sui pod già in terminazione e non modifica un pod che Liqo ha già recuperato durante il backoff.
 * Il Cleanup Controller non rimuove una policy prima del periodo di grazia né mentre esiste un pod remoto attivo o in terminazione.
 * Gli errori di accesso al cluster o di cancellazione vengono restituiti dalla riconciliazione e ritentati secondo il comportamento standard di `controller-runtime`.
 * Sono necessari i permessi Kubernetes per leggere e osservare i **Nodi** e i Pod, gestire risorse custom `NamespaceOffloading`, emettere eventi e gestire `Lease` per la Leader Election.

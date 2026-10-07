@@ -1,5 +1,7 @@
 # Stage 1: Build the manager binary
 FROM golang:1.22-alpine AS builder
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -12,8 +14,8 @@ RUN go mod download
 COPY main.go main.go
 COPY controllers/ controllers/
 
-# Build statically linked binary
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -o manager main.go
+# Build statically linked binary per l'architettura target
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o manager main.go
 
 # Stage 2: Minimal base image for runtime
 FROM gcr.io/distroless/static:nonroot
