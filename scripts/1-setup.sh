@@ -5,12 +5,18 @@ echo -e "\033[1;32m Step 1: Creating local and remote Kind clusters...\033[0m"
 kind create cluster --name cluster-local || true
 kind create cluster --name cluster-remote || true
 
-echo -e "\033[1;32m Step 2: Installing Liqo (v1.0+)...\033[0m"
+echo -e "\033[1;32m Step 1.5: Installing Prometheus CRDs...\033[0m"
+# Installiamo i CRD necessari per PodMonitor e ServiceMonitor su entrambi i cluster
+for ctx in kind-cluster-local kind-cluster-remote; do
+  kubectl --context $ctx apply --server-side -f https://github.com/prometheus-operator/prometheus-operator/releases/download/v0.72.0/stripped-down-crds.yaml
+done
+
+echo -e "\033[1;32m Step 2: Installing Liqo (v1.0+) with metrics enabled...\033[0m"
 kubectl config use-context kind-cluster-local
-liqoctl install kind --cluster-id cluster-local
+liqoctl install kind --cluster-id cluster-local --enable-metrics
 
 kubectl config use-context kind-cluster-remote
-liqoctl install kind --cluster-id cluster-remote
+liqoctl install kind --cluster-id cluster-remote --enable-metrics
 
 echo -e "\033[1;32m Step 3: Peering clusters using NodePort...\033[0m"
 liqoctl peer --context kind-cluster-local --remote-context kind-cluster-remote --gw-server-service-type NodePort
@@ -23,5 +29,5 @@ done
 echo -e "\033[1;32mVirtual node detected! Waiting for it to become Ready...\033[0m"
 kubectl wait --for=condition=Ready node -l liqo.io/type=virtual-node --timeout=120s --context kind-cluster-local
 
-echo -e"\033[1;32mSetup complete! Virtual node is ready. NO namespaces are offloaded.\033[0m"
+echo -e "\033[1;32mSetup complete! Virtual node is ready. NO namespaces are offloaded.\033[0m"
 kubectl get nodes --context kind-cluster-local

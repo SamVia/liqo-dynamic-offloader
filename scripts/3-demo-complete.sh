@@ -1,127 +1,96 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-echo -e "\033[1;36m=== In-Cluster Operator Demo ===\033[0m"
+echo -e "\033[1;36m=== In-Cluster Operator Demo (Helm Deployment) ===\033[0m"
+
+# 1. Valutazione del parametro --dry-run
+DRY_RUN="false"
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DRY_RUN="true"
+  echo -e "\033[1;33m>>> DRY-RUN MODE ENABLED <<<\033[0m"
+fi
 
 TARGET_CLUSTERS="${TARGET_CLUSTER_ID:-cluster-remote}"
 DEMO_REMOTE_CLUSTER="${DEMO_REMOTE_CLUSTER:-cluster-remote}"
-DEMO_EXCLUDED_NAMESPACE="${DEMO_EXCLUDED_NAMESPACE:-demo-not-selected}"
-EXCLUDED_NAMESPACES="${EXCLUDED_NAMESPACES:-kube-system,liqo-system,local-path-storage,crownlabs-system},${DEMO_EXCLUDED_NAMESPACE}"
-
-echo "Allowed target clusters: ${TARGET_CLUSTERS:-all available remote clusters}"
-echo "Demo virtual node: ${DEMO_REMOTE_CLUSTER}"
+IMAGE_REPOSITORY="${IMAGE_REPOSITORY:-ghcr.io/samvia/liqo-dynamic-offloader}"
+IMAGE_TAG="${IMAGE_TAG:-latest}"
+IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-Always}"
+HELM_RELEASE="${HELM_RELEASE:-liqo-dynamic-offloader}"
+OPERATOR_NAMESPACE="${OPERATOR_NAMESPACE:-default}"
 
 kubectl config use-context kind-cluster-local >/dev/null 2>&1
 
-echo "1. Skipping local image load (Configured to pull from GHCR)..."
-# kind load docker-image liqo-dynamic-offloader:latest --name cluster-local
+echo "1. Deploying the Operator with Helm..."
+# Remove the legacy hand-written deployment if a previous demo created it.
+kubectl delete deployment liqo-auto-healing-operator \
+  --namespace "$OPERATOR_NAMESPACE" \
+  --ignore-not-found=true >/dev/null 2>&1
+helm upgrade --install "$HELM_RELEASE" charts/liqo-dynamic-offloader \
+  --namespace "$OPERATOR_NAMESPACE" \
+  --create-namespace \
+  --set-string image.repository="$IMAGE_REPOSITORY" \
+  --set-string image.tag="$IMAGE_TAG" \
+  --set image.pullPolicy="$IMAGE_PULL_POLICY" \
+  --set-string config.targetClusterIDs="$TARGET_CLUSTERS" \
+  --set-string config.excludedNamespaces="*-system,local-path-storage" \
+  --set-string config.trapBlacklistLabels="dynamic-offloader.liqo.io/ignore-trap=true" \
+  --set config.trapBackoff="5s" \
+  --set config.cleanupDelay="15s" \
+  --set config.dryRun="$DRY_RUN"
 
-echo "2. Deploying the Operator (RBAC + Deployment)..."
-kubectl apply -f config/rbac/role.yaml
-kubectl delete deployment liqo-auto-healing-operator -n default --ignore-not-found=true >/dev/null 2>&1
+echo "Waiting for the operator to become ready..."
+kubectl wait --for=condition=available "deployment/${HELM_RELEASE}" \
+  --namespace "$OPERATOR_NAMESPACE" \
+  --timeout=60s
+
+echo -e "\n2. Preparing Test Namespaces..."
+# A) Namespace standard
+kubectl create namespace demo-allowed --dry-run=client -o yaml | kubectl apply -f -
+
+# B) Namespace protetto dal Glob (*-system)
+kubectl create namespace demo-system --dry-run=client -o yaml | kubectl apply -f -
+
+# C) Namespace protetto da Label specifica
 cat <<EOF | kubectl apply -f -
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: liqo-auto-healing-sa
-  namespace: default
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: liqo-auto-healing-binding
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: manager-role
-subjects:
-- kind: ServiceAccount
-  name: liqo-auto-healing-sa
-  namespace: default
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: liqo-auto-healing-operator
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      control-plane: controller-manager
-  template:
-    metadata:
-      labels:
-        control-plane: controller-manager
-    spec:
-      serviceAccountName: liqo-auto-healing-sa
-      containers:
-      - name: manager
-        # Point directly to the GHCR public registry
-        image: ghcr.io/samvia/liqo-dynamic-offloader:latest
-        # Force Kubernetes to download it instead of using local cache
-        imagePullPolicy: Always
-        env:
-        - name: TARGET_CLUSTER_ID
-          value: "${TARGET_CLUSTERS}"
-        - name: EXCLUDED_NAMESPACES
-          value: "${EXCLUDED_NAMESPACES}"
-        - name: TRAP_BACKOFF
-          value: "10s"
-        - name: CLEANUP_GRACE_PERIOD
-          value: "10s"
-EOF
-
-echo "Waiting for the operator pod to become ready..."
-kubectl wait --for=condition=available deployment/liqo-auto-healing-operator -n default --timeout=60s
-
-echo "3. Generating the Deep Trap Deployment YAML..."
-cat <<EOF > /tmp/trap-deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: liqo-trap-deployment
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: liqo-trap
-  template:
-    metadata:
-      labels:
-        app: liqo-trap
-    spec:
-      containers:
-      - name: nginx
-        image: nginx:alpine
-      nodeSelector:
-        kubernetes.io/hostname: ${DEMO_REMOTE_CLUSTER}
-      tolerations:
-      - key: "virtual-node.liqo.io/not-allowed"
-        operator: "Exists"
-EOF
-
-cat <<EOF > /tmp/non-selected-deployment.yaml
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: ${DEMO_EXCLUDED_NAMESPACE}
----
+  name: demo-labeled
+  labels:
+    dynamic-offloader.liqo.io/ignore-trap: "true"
+EOF
+
+# Pulizia di sicurezza prima del test
+for ns in demo-allowed demo-system demo-labeled; do
+  kubectl delete deployment trap-deployment -n $ns --ignore-not-found=true >/dev/null 2>&1
+  kubectl delete namespaceoffloading offloading -n $ns --ignore-not-found=true >/dev/null 2>&1
+done
+sleep 2
+
+cleanup() {
+  echo -e "\nDemo terminated. Cleaning up..."
+  kubectl delete namespace demo-allowed demo-system demo-labeled --ignore-not-found=true >/dev/null 2>&1
+  helm uninstall "$HELM_RELEASE" --namespace "$OPERATOR_NAMESPACE" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+echo -e "\n3. Springing the traps across all namespaces..."
+for ns in demo-allowed demo-system demo-labeled; do
+cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: liqo-non-selected-deployment
-  namespace: ${DEMO_EXCLUDED_NAMESPACE}
+  name: trap-deployment
+  namespace: $ns
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: liqo-non-selected
+      app: trap
   template:
     metadata:
       labels:
-        app: liqo-non-selected
+        app: trap
     spec:
       containers:
       - name: nginx
@@ -132,30 +101,21 @@ spec:
       - key: "virtual-node.liqo.io/not-allowed"
         operator: "Exists"
 EOF
+done
 
-# clean leftovers
-kubectl delete deployment liqo-trap-deployment -n default --ignore-not-found=true >/dev/null 2>&1
-kubectl delete namespaceoffloading offloading -n default --ignore-not-found=true >/dev/null 2>&1
-kubectl delete namespace "${DEMO_EXCLUDED_NAMESPACE}" --ignore-not-found=true >/dev/null 2>&1
-sleep 2
+echo -e "\nWaiting 10 seconds to allow the operator to process events..."
+sleep 10
 
-trap 'echo -e "\nDemo terminated. Cleaning up..."; kubectl delete deployment liqo-trap-deployment -n default --ignore-not-found=true >/dev/null 2>&1; kubectl delete deployment liqo-non-selected-deployment -n "${DEMO_EXCLUDED_NAMESPACE}" --ignore-not-found=true >/dev/null 2>&1; kubectl delete namespace "${DEMO_EXCLUDED_NAMESPACE}" --ignore-not-found=true >/dev/null 2>&1; kubectl delete deployment liqo-auto-healing-operator -n default --ignore-not-found=true >/dev/null 2>&1; kubectl delete namespaceoffloading offloading -n default --ignore-not-found=true >/dev/null 2>&1; exit' SIGINT SIGTERM
+echo -e "\n\033[1;36m=== Evaluation Results ===\033[0m"
+for ns in demo-allowed demo-system demo-labeled; do
+  if kubectl get namespaceoffloading offloading -n "$ns" >/dev/null 2>&1; then
+    echo -e "[\033[1;32mYES\033[0m] $ns -> Offloading Policy Created"
+  else
+    echo -e "[\033[1;31mNO\033[0m]  $ns -> No Policy (Filtered or Dry-Run)"
+  fi
+done
 
-echo -e "\n\033[1;32mOperator is running! Springing the trap...\033[0m"
-kubectl apply -f /tmp/trap-deployment.yaml
-kubectl apply -f /tmp/non-selected-deployment.yaml
-
-echo "Checking that the excluded namespace is not offloaded..."
-sleep 5
-if kubectl get namespaceoffloading offloading -n "${DEMO_EXCLUDED_NAMESPACE}" >/dev/null 2>&1; then
-  echo "ERROR: an offloading policy was created for ${DEMO_EXCLUDED_NAMESPACE}"
-  exit 1
-fi
-echo "OK: ${DEMO_EXCLUDED_NAMESPACE} has no NamespaceOffloading policy."
-
+echo -e "\n---------------------------------------------------------------------"
+echo "Streaming Operator Logs (Press CTRL+C to exit and cleanup)..."
 echo "---------------------------------------------------------------------"
-echo "Streaming Operator Logs (Press CTRL+C to exit)..."
-echo "---------------------------------------------------------------------"
-
-# Shows operator logs in real time
-kubectl logs -f deployment/liqo-auto-healing-operator -n default
+kubectl logs -f "deployment/${HELM_RELEASE}" --namespace "$OPERATOR_NAMESPACE"

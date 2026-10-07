@@ -153,6 +153,40 @@ To explicitly restore the initial scenario:
 ./scripts/0-reset.sh
 ```
 
+## Demo 3: Local Operator Validation (`4-locale.sh`)
+
+For development and controller behavior validation without building or
+deploying a container, use [`scripts/4-locale.sh`](scripts/4-locale.sh). The
+script runs `go run ./main.go` on the host, writes its output to
+`/tmp/liqo-operator-local.log`, and uses dynamic polling instead of fixed
+waits.
+
+```bash
+./scripts/4-locale.sh
+```
+
+This demo:
+
+1. Creates `demo-allowed`, `demo-system`, and `demo-labeled`.
+2. Starts the operator locally with the same Trap and Cleanup flags used by
+   the Helm demo.
+3. Deploys remote-targeted workloads and verifies the namespace filtering
+   behavior.
+4. Deletes the allowed workload and waits for the cleanup countdown to remove
+   its `NamespaceOffloading` policy.
+5. Prints the local operator log after the checks complete.
+
+Use `--dry-run` to exercise filtering and logging without creating or deleting
+offloading policies:
+
+```bash
+./scripts/4-locale.sh --dry-run
+```
+
+Unlike `3-demo-complete.sh`, this script does not install a Helm release or
+pull a container image. It is intended for fast local development feedback;
+use the Helm demo to validate the packaged, in-cluster deployment.
+
 ## Helm Deployment
 
 The recommended deployment method is the Helm chart in
@@ -203,6 +237,26 @@ go test -v ./...
 
 The tests cover pods in `OffloadingBackOff`, pre-existing policies, excluded namespaces, terminating pods, active remote pods, pending remote-bound pods, terminal pods, and local pods.
 
+## CI/CD Pipelines
+
+GitHub Actions validates every pull request and push that can affect the
+operator, chart, scripts, or container image:
+
+* Go dependencies, `go vet`, tests, and the binary build.
+* Helm linting and manifest rendering.
+* Bash syntax validation for every script in `scripts/`.
+* A non-publishing Docker build on pull requests.
+
+Pushes to `main` publish the container image to GHCR with the `latest` and
+commit-SHA tags. Pushing a version tag such as `v0.2.0` also publishes
+immutable `0.2.0` and `0.2` image tags. The complete demo can consume any
+published tag with `IMAGE_TAG`.
+
+Changes under `charts/` are validated before the Helm Chart Releaser publishes
+the chart repository metadata to the `gh-pages` branch. Bump
+`version` and `appVersion` in `charts/liqo-dynamic-offloader/Chart.yaml` before
+releasing a chart update.
+
 ## Build and Containerization
 
 To generate RBAC manifests using Kubebuilder markers:
@@ -223,18 +277,9 @@ To build the containerized Docker image:
 make docker-build IMG=yourusername/liqo-dynamic-offloader:latest
 ```
 
-### Pre-built Images (Docker Hub & GHCR)
-If you want to use the operator without compiling it from source, you can reference the public images hosted on either Docker Hub or GitHub Container Registry directly in your Kubernetes manifests or Deployments:
+### Pre-built Image (GHCR)
 
-**Option 1: Docker Hub**
-```yaml
-    spec:
-      containers:
-      - name: manager
-        image: samvia/liqo-dynamic-offloader:latest
-```
-
-**Option 2: GitHub Container Registry (GHCR)**
+The CI/CD pipeline publishes the image to GitHub Container Registry:
 
 ```yaml
     spec:
@@ -242,6 +287,9 @@ If you want to use the operator without compiling it from source, you can refere
       - name: manager
         image: ghcr.io/samvia/liqo-dynamic-offloader:latest
 ```
+
+For reproducible deployments, prefer a version tag such as
+`ghcr.io/samvia/liqo-dynamic-offloader:0.2.0` instead of `latest`.
 
 
 
