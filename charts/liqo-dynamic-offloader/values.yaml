@@ -1,0 +1,63 @@
+image:
+  repository: ghcr.io/samvia/liqo-dynamic-offloader
+  pullPolicy: IfNotPresent
+  tag: "0.1.0"
+
+imagePullSecrets: []
+
+# Number of controller-manager replicas. Leader election keeps one replica active.
+replicaCount: 1
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Operator command-line configuration.
+config:
+  targetClusterIDs: ""
+  excludedNamespaces: "kube-system,liqo-system,local-path-storage,crownlabs-system"
+  trapWhitelistLabels: ""
+  trapBlacklistLabels: ""
+  cleanupWhitelistLabels: ""
+  cleanupBlacklistLabels: ""
+  trapBackoff: "2s"
+  cleanupDelay: "10s"
+  dryRun: false
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+serviceAccount:
+  create: true
+  name: liqo-dynamic-offloader
+
+# Reserved for future webhook support. Webhooks are not implemented and must
+# remain disabled until the Service, manager endpoint, and certificate flow
+# are delivered together.
+webhook:
+  enabled: false
+  certManager:
+    issuerRef:
+      name: liqo-webhook-issuer
+      kind: Issuer
