@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -18,8 +19,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
+// Metrics for Prometheus.
 var (
-	// liqoCleanupNamespacesTotal tracks the total number of offloading policies successfully revoked.
 	liqoCleanupNamespacesTotal = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "liqo_cleanup_namespaces_total",
@@ -27,8 +28,6 @@ var (
 		},
 	)
 
-	// liqoCleanupActiveRemotePods tracks the current number of active remote pods per namespace.
-	// We use a GaugeVec to label by namespace, avoiding global overwrite issues across different reconciliations.
 	liqoCleanupActiveRemotePods = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "liqo_cleanup_active_remote_pods",
@@ -39,33 +38,49 @@ var (
 )
 
 func init() {
-	// Register custom metrics with the global controller-runtime metrics registry
 	metrics.Registry.MustRegister(liqoCleanupNamespacesTotal, liqoCleanupActiveRemotePods)
 }
 
+// LiqoCleanupReconciler manages NamespaceOffloading resources based on active remote workloads.
 type LiqoCleanupReconciler struct {
 	client.Client
 	TargetClusters     []string
-	ExcludedNamespaces map[string]bool
+	ExcludedNamespaces []string
+	WhitelistLabels    map[string]string
+	BlacklistLabels    map[string]string
 	Recorder           record.EventRecorder
-	GracePeriod        time.Duration
+	CleanupDelay       time.Duration
+	DryRun             bool
 }
+
+const emptySinceAnnotation = "dynamic-offloader.liqo.io/empty-since"
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
+// Reconcile removes a NamespaceOffloading policy after the namespace has
+// remained free of active remote workloads for the configured cleanup delay.
+//
+// The empty-since annotation persists the countdown in the API so the cleanup
+// decision survives controller restarts and is based on observed cluster state
+// rather than an in-memory timer.
 func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	namespace := req.Namespace
 
-	// Exclude system and critical namespaces to prevent accidental deletion of their offloading configurations.
-	if r.ExcludedNamespaces[namespace] {
+	var ns corev1.Namespace
+	if err := r.Get(ctx, client.ObjectKey{Name: namespace}, &ns); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if !r.isNamespaceAllowed(&ns) {
+		// Protected namespaces must not have their offloading policy changed.
 		return ctrl.Result{}, nil
 	}
 
-	// Verify if a NamespaceOffloading resource exists for the current namespace.
 	offloadCR := &unstructured.Unstructured{}
 	offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "offloading.liqo.io",
@@ -74,86 +89,151 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	})
 
 	if err := r.Get(ctx, client.ObjectKey{Name: "offloading", Namespace: namespace}, offloadCR); err != nil {
-		// If the resource is not found, the cleanup is already complete.
+		// Cleanup is already complete when the policy no longer exists.
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Check on policy age with a grace period to prevent deletion from Cleanup Controller before either liqo or the Trap Controller have kicked and rescheduled the pod
-	policyAge := time.Since(offloadCR.GetCreationTimestamp().Time)
-	if policyAge < r.GracePeriod {
-		logger.V(1).Info("Policy is too young for cleanup. Respecting grace period.", "namespace", namespace, "age", policyAge.Round(time.Second))
-		return ctrl.Result{RequeueAfter: r.GracePeriod}, nil
-	}
-
-	// Retrieve all Pods within the namespace to evaluate their current scheduling and execution status.
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, client.InNamespace(namespace)); err != nil {
 		logger.Error(err, "Failed to list pods in namespace")
 		return ctrl.Result{}, err
 	}
-	var nodeList corev1.NodeList
-	if err := r.List(ctx, &nodeList); err != nil {
-		logger.Error(err, "Failed to list nodes")
-		return ctrl.Result{}, err
-	}
-	nodes := make(map[string]corev1.Node, len(nodeList.Items))
-	for _, node := range nodeList.Items {
-		nodes[node.Name] = node
-	}
 
-	// Calculate the number of active Pods that rely on the remote cluster.
+	// Count active pods relying on the remote cluster. Pending pods with an
+	// explicit remote target are included because they still depend on the
+	// NamespaceOffloading policy to complete scheduling.
 	activeOffloadedPods := 0
 	for _, pod := range podList.Items {
-		// Condition A: The pod explicitly requests scheduling on the remote cluster via NodeSelector.
-		explicitTarget := r.podTargetsAllowedCluster(&pod, nodes)
-
-		// Condition B: The pod has already been scheduled and is running on the remote node.
-		scheduledRemote := r.isLiqoRemotePod(&pod, nodes)
-
-		// Condition C: The pod is pending scheduling specifically for the remote cluster.
-		// This ensures we do not block cleanup for pending pods intended for local nodes.
+		explicitTarget := r.podTargetsAllowedCluster(ctx, &pod)
+		scheduledRemote := r.isLiqoRemotePod(ctx, &pod)
 		isPendingRemote := pod.Status.Phase == corev1.PodPending && pod.Spec.NodeName == "" && explicitTarget
 
-		// If the pod is tied to the remote cluster, check if it's active or gracefully shutting down
 		if explicitTarget || scheduledRemote || isPendingRemote {
 			isTerminating := !pod.DeletionTimestamp.IsZero()
 			isTerminalPhase := pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 
-			// Consider the pod active if it's terminating (graceful shutdown) OR if it hasn't reached a terminal state
+			// Terminating pods remain active until deletion completes, while
+			// succeeded and failed pods no longer require remote placement.
 			if isTerminating || !isTerminalPhase {
 				activeOffloadedPods++
 			}
 		}
 	}
 
-	// Update the Prometheus Gauge with the current count for this namespace
 	liqoCleanupActiveRemotePods.WithLabelValues(namespace).Set(float64(activeOffloadedPods))
 
-	// If no active remote pods remain, proceed to revoke the offloading configuration.
+	annotations := offloadCR.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+
 	if activeOffloadedPods == 0 {
-		// Confirm the resource was successfully fetched before attempting deletion.
-		if offloadCR.GetUID() != "" {
-			logger.Info("Zero active remote pods remain. Initiating offload cleanup.", "namespace", namespace)
+		if r.CleanupDelay == 0 {
+			// A zero delay is an explicit operator choice to disable automatic
+			// deletion while retaining metrics and reconciliation behavior.
+			logger.Info("Cleanup delay is 0, offloading policy will never be deleted automatically.", "namespace", namespace)
+			return ctrl.Result{}, nil
+		}
 
-			if err := r.Delete(ctx, offloadCR); client.IgnoreNotFound(err) != nil {
-				logger.Error(err, "Failed to delete NamespaceOffloading")
-				return ctrl.Result{}, err
+		emptySinceStr, hasAnnotation := annotations[emptySinceAnnotation]
+		if !hasAnnotation {
+			// Start a durable countdown instead of deleting immediately. This
+			// protects against short gaps between remote workload transitions.
+			annotations[emptySinceAnnotation] = time.Now().UTC().Format(time.RFC3339)
+			offloadCR.SetAnnotations(annotations)
+
+			if !r.DryRun {
+				if err := r.Update(ctx, offloadCR); err != nil {
+					return ctrl.Result{}, err
+				}
+				logger.Info("Namespace is empty. Starting cleanup countdown.", "namespace", namespace, "delay", r.CleanupDelay)
+			} else {
+				logger.Info("[DRY RUN] Would set empty-since annotation", "namespace", namespace)
 			}
+			return ctrl.Result{RequeueAfter: r.CleanupDelay}, nil
+		}
 
-			logger.Info("Successfully deleted NamespaceOffloading. Namespace isolation restored.", "namespace", namespace)
+		emptySince, _ := time.Parse(time.RFC3339, emptySinceStr)
+		if time.Since(emptySince) >= r.CleanupDelay {
+			if !r.DryRun {
+				// Delete only after the namespace has stayed empty for the full
+				// delay, then emit a custom Kubernetes event.
+				if err := r.Delete(ctx, offloadCR); client.IgnoreNotFound(err) != nil {
+					logger.Error(err, "Failed to delete NamespaceOffloading")
+					return ctrl.Result{}, err
+				}
+				logger.Info("Successfully deleted NamespaceOffloading. Namespace isolation restored.", "namespace", namespace)
+				liqoCleanupNamespacesTotal.Inc()
+				r.Recorder.Event(offloadCR, corev1.EventTypeNormal, "Successful Cleanup", "Namespace isolation restored: offloading policy revoked.")
+			} else {
+				// Dry-run preserves the countdown and reports the deletion that
+				// would have occurred without changing cluster state.
+				logger.Info("[DRY RUN] Would delete NamespaceOffloading", "namespace", namespace)
+			}
+		} else {
+			return ctrl.Result{RequeueAfter: r.CleanupDelay - time.Since(emptySince)}, nil
+		}
 
-			// Increment the Prometheus Counter on successful deletion
-			liqoCleanupNamespacesTotal.Inc()
+	} else {
+		if _, hasAnnotation := annotations[emptySinceAnnotation]; hasAnnotation {
+			// New remote work invalidates the countdown and keeps the policy in
+			// place for subsequent scheduling and reconciliation.
+			delete(annotations, emptySinceAnnotation)
+			offloadCR.SetAnnotations(annotations)
 
-			// Emit a native Kubernetes event to the cluster
-			r.Recorder.Event(offloadCR, corev1.EventTypeNormal, "Successful Cleanup", "Namespace isolation restored: offloading policy revoked due to zero active remote pods.")
+			if !r.DryRun {
+				if err := r.Update(ctx, offloadCR); err != nil {
+					return ctrl.Result{}, err
+				}
+				logger.Info("New remote pods detected. Cancelled cleanup countdown.", "namespace", namespace)
+			} else {
+				logger.Info("[DRY RUN] Would remove empty-since annotation", "namespace", namespace)
+			}
 		}
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func (r *LiqoCleanupReconciler) podTargetsAllowedCluster(pod *corev1.Pod, nodes map[string]corev1.Node) bool {
+// isNamespaceAllowed applies namespace exclusions and label policy before
+// cleanup can mutate the NamespaceOffloading resource.
+func (r *LiqoCleanupReconciler) isNamespaceAllowed(ns *corev1.Namespace) bool {
+	for _, pattern := range r.ExcludedNamespaces {
+		if matched, _ := filepath.Match(pattern, ns.Name); matched {
+			return false
+		}
+	}
+	for k, v := range r.BlacklistLabels {
+		if val, exists := ns.Labels[k]; exists && (v == "" || val == v) {
+			return false
+		}
+	}
+	if len(r.WhitelistLabels) > 0 {
+		for k, v := range r.WhitelistLabels {
+			if val, exists := ns.Labels[k]; !exists || (v != "" && val != v) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// checkRemoteNode verifies whether a scheduled node is a Liqo remote endpoint
+// when no explicit target-cluster allowlist is configured.
+func (r *LiqoCleanupReconciler) checkRemoteNode(ctx context.Context, nodeName string) bool {
+	if nodeName == "" {
+		return false
+	}
+	var node corev1.Node
+	if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err == nil {
+		return isLiqoRemoteNode(node)
+	}
+	return false
+}
+
+// podTargetsAllowedCluster checks whether a pod explicitly targets an eligible
+// remote cluster through its node selector.
+func (r *LiqoCleanupReconciler) podTargetsAllowedCluster(ctx context.Context, pod *corev1.Pod) bool {
 	if pod.Spec.NodeSelector == nil {
 		return false
 	}
@@ -161,10 +241,10 @@ func (r *LiqoCleanupReconciler) podTargetsAllowedCluster(pod *corev1.Pod, nodes 
 	if len(r.TargetClusters) > 0 {
 		return r.clusterAllowed(target)
 	}
-	node, hasNode := nodes[target]
-	return (hasNode && isLiqoRemoteNode(node)) || strings.HasPrefix(target, "virtual-node-")
+	return r.checkRemoteNode(ctx, target) || strings.HasPrefix(target, "virtual-node-")
 }
 
+// clusterAllowed verifies that a cluster ID is in the configured allowlist.
 func (r *LiqoCleanupReconciler) clusterAllowed(clusterID string) bool {
 	for _, allowed := range r.TargetClusters {
 		if allowed == clusterID {
@@ -174,28 +254,26 @@ func (r *LiqoCleanupReconciler) clusterAllowed(clusterID string) bool {
 	return false
 }
 
-func (r *LiqoCleanupReconciler) isLiqoRemotePod(pod *corev1.Pod, nodes map[string]corev1.Node) bool {
-	node, hasNode := nodes[pod.Spec.NodeName]
-	remoteClusterID := node.Labels["liqo.io/remote-cluster-id"]
-	if remoteClusterID == "" {
-		remoteClusterID = pod.Labels["liqo.io/remote-cluster-id"]
-	}
+// isLiqoRemotePod identifies pods associated with a Liqo remote cluster through
+// Liqo metadata or remote scheduling information.
+func (r *LiqoCleanupReconciler) isLiqoRemotePod(ctx context.Context, pod *corev1.Pod) bool {
+	remoteClusterID := pod.Labels["liqo.io/remote-cluster-id"]
 	if remoteClusterID == "" {
 		remoteClusterID = pod.Annotations["liqo.io/remote-cluster-id"]
 	}
 	if len(r.TargetClusters) == 0 {
-		return remoteClusterID != "" || (hasNode && isLiqoRemoteNode(node)) || strings.HasPrefix(pod.Spec.NodeName, "virtual-node-")
+		return remoteClusterID != "" || r.checkRemoteNode(ctx, pod.Spec.NodeName) || strings.HasPrefix(pod.Spec.NodeName, "virtual-node-")
 	}
 	return r.clusterAllowed(remoteClusterID) || r.clusterAllowed(pod.Spec.NodeName) || r.clusterAllowed(pod.Spec.NodeSelector["kubernetes.io/hostname"])
 }
 
+// isLiqoRemoteNode identifies Liqo virtual nodes by metadata or name prefix.
 func isLiqoRemoteNode(node corev1.Node) bool {
 	return node.Labels["liqo.io/remote-cluster-id"] != "" || strings.HasPrefix(node.Name, "virtual-node-")
 }
 
-// LiqoCleanupPredicate optimizes the controller by filtering events to reduce unnecessary Reconcile calls.
-// We only trigger reconciliation when pod state changes affect our remote counting logic.
-// Exposed publicly to allow for unit testing.
+// LiqoCleanupPredicate filters events to pod lifecycle changes that can alter
+// remote workload accounting and cleanup eligibility.
 func LiqoCleanupPredicate() predicate.Predicate {
 	return predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool { return true },
@@ -206,8 +284,6 @@ func LiqoCleanupPredicate() predicate.Predicate {
 			if !okOld || !okNew {
 				return false
 			}
-			// Trigger reconciliation only if the Pod's Phase, assigned Node, or DeletionTimestamp changes.
-			// Added DeletionTimestamp check to intercept pods entering graceful shutdown phase.
 			return oldPod.Status.Phase != newPod.Status.Phase ||
 				oldPod.Spec.NodeName != newPod.Spec.NodeName ||
 				oldPod.DeletionTimestamp.IsZero() != newPod.DeletionTimestamp.IsZero()
@@ -215,10 +291,11 @@ func LiqoCleanupPredicate() predicate.Predicate {
 	}
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// SetupWithManager registers the cleanup reconciler for pod events and applies
+// the predicate before requests enter the controller work queue.
 func (r *LiqoCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
-		WithEventFilter(LiqoCleanupPredicate()). // Uses the extracted predicate
+		WithEventFilter(LiqoCleanupPredicate()).
 		Complete(r)
 }

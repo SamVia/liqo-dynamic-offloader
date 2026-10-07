@@ -27,3 +27,9 @@ c.out
 # OS specific files
 .DS_Store
 Thumbs.db
+
+# liqo metrics dump
+
+liqo_metrics_dump
+
+private

@@ -2,11 +2,11 @@ package controllers
 
 import (
 	"context"
+	"path/filepath"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -18,66 +18,76 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
-// LiqoTrapReconciler watches for Pods that are stuck in an "OffloadingBackOff"
-// state and automatically provisions the missing NamespaceOffloading policies to rescue them.
+// LiqoTrapReconciler watches for Pods stuck in OffloadingBackOff and
+// provisions the NamespaceOffloading policy required to rescue them.
 type LiqoTrapReconciler struct {
 	client.Client
 	TargetClusters     []string
-	ExcludedNamespaces map[string]bool
+	ExcludedNamespaces []string
+	WhitelistLabels    map[string]string
+	BlacklistLabels    map[string]string
 	BackoffDuration    time.Duration
+	DryRun             bool
 }
 
-const lastRemediationAnnotation = "liqo-dynamic-offloader.crownlabs.polito.it/last-remediation"
+// Annotations used to coordinate remediation attempts with Liqo's asynchronous
+// offloading behavior.
+const lastRemediationAnnotation = "dynamic-offloader.liqo.io/last-remediation"
+const forceSyncAnnotation = "dynamic-offloader.liqo.io/force-sync"
 
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;create;update;patch
 
+// Reconcile handles pods trapped in Liqo's OffloadingBackOff state. It first
+// ensures that the namespace has an offloading policy, then waits for Liqo's
+// asynchronous admission and scheduling logic to process that policy.
+//
+// The pod is re-read after the wait because Liqo may recover it without further
+// intervention. If it remains trapped, the force-sync annotation requests a
+// fresh synchronization attempt. A namespace-level remediation timestamp
+// prevents repeated interventions and reconciliation hot-loops.
 func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	namespace := req.Namespace
+	namespaceName := req.Namespace
 	podName := req.Name
 
-	// 1. Exclude Protected Critical Namespaces (Early Exit Pattern)
-	// System namespaces must not be automatically offloaded to prevent cluster instability.
-	if r.ExcludedNamespaces[namespace] {
+	var ns corev1.Namespace
+	if err := r.Get(ctx, client.ObjectKey{Name: namespaceName}, &ns); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	if !r.isNamespaceAllowed(&ns) {
+		// Protected namespaces must never be changed by automatic remediation.
 		return ctrl.Result{}, nil
 	}
 
-	// 2. Retrieve the Target Pod
 	var stuckPod corev1.Pod
 	if err := r.Get(ctx, req.NamespacedName, &stuckPod); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Ignore pods that are already gracefully shutting down to avoid hot-loops on dying resources.
 	if !stuckPod.DeletionTimestamp.IsZero() {
+		// A terminating pod is already being removed; do not restart remediation
+		// work or create a hot-loop while Kubernetes completes deletion.
 		return ctrl.Result{}, nil
 	}
 
-	// 3. Verify OffloadingBackOff State (Early Exit Pattern)
-	// We check both the main pod status reason and individual container waiting states.
-	isTrapped := false
-	if stuckPod.Status.Reason == "OffloadingBackOff" {
-		isTrapped = true
-	}
-	for _, cs := range stuckPod.Status.ContainerStatuses {
-		if cs.State.Waiting != nil && cs.State.Waiting.Reason == "OffloadingBackOff" {
-			isTrapped = true
+	logger.Info("TRIGGER FAIL-FAST: Pod in OffloadingBackOff intercepted!", "namespace", namespaceName, "pod", podName)
+
+	// Enforce the persisted namespace-level remediation cooldown before mutating
+	// resources. Persisting this timestamp makes the cooldown survive restarts
+	// and coordinate workers processing multiple trapped pods in one namespace.
+	if lastRemediation := ns.GetAnnotations()[lastRemediationAnnotation]; lastRemediation != "" {
+		remediationTime, parseErr := time.Parse(time.RFC3339Nano, lastRemediation)
+		if parseErr == nil {
+			remaining := r.BackoffDuration - time.Since(remediationTime)
+			if remaining > 0 {
+				logger.V(1).Info("Remediation backoff is active for namespace", "namespace", namespaceName, "remaining", remaining.Round(time.Millisecond))
+				return ctrl.Result{RequeueAfter: remaining}, nil
+			}
 		}
 	}
-	for _, cs := range stuckPod.Status.InitContainerStatuses {
-		if cs.State.Waiting != nil && cs.State.Waiting.Reason == "OffloadingBackOff" {
-			isTrapped = true
-		}
-	}
-
-	// If the pod is not currently trapped, interrupt the reconciliation immediately.
-	if !isTrapped {
-		return ctrl.Result{}, nil
-	}
-
-	// === REMEDIATION PHASE (Atomic) ===
-	logger.Info("TRIGGER FAIL-FAST: Pod in OffloadingBackOff intercepted!", "namespace", namespace, "pod", podName)
 
 	offloadCR := &unstructured.Unstructured{}
 	offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
@@ -86,18 +96,18 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		Kind:    "NamespaceOffloading",
 	})
 
-	err := r.Get(ctx, client.ObjectKey{Name: "offloading", Namespace: namespace}, offloadCR)
+	err := r.Get(ctx, client.ObjectKey{Name: "offloading", Namespace: namespaceName}, offloadCR)
 
-	// 4. Create the NamespaceOffloading Policy if missing
 	if apierrors.IsNotFound(err) {
+		// Create the minimum policy required to let Liqo establish remote
+		// placement before the trapped pod is checked again.
 		offloadCR.SetName("offloading")
-		offloadCR.SetNamespace(namespace)
+		offloadCR.SetNamespace(namespaceName)
 		spec := map[string]interface{}{
 			"namespaceMappingStrategy": "DefaultName",
 			"podOffloadingStrategy":    "LocalAndRemote",
 		}
 
-		// Inject target clusters dynamically if configured
 		if len(r.TargetClusters) > 0 {
 			selector := corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
 				MatchExpressions: []corev1.NodeSelectorRequirement{{
@@ -107,128 +117,157 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			}}}
 			selectorMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&selector)
 			if err != nil {
-				logger.Error(err, "Failed to convert Liqo cluster selector")
 				return ctrl.Result{}, err
 			}
 			spec["clusterSelector"] = selectorMap
 		}
 		offloadCR.Object["spec"] = spec
 
-		if err := r.Create(ctx, offloadCR); err != nil {
-			logger.Error(err, "Failed to create NamespaceOffloading policy")
-			return ctrl.Result{}, err
+		if !r.DryRun {
+			if err := r.Create(ctx, offloadCR); err != nil {
+				logger.Error(err, "Failed to create NamespaceOffloading policy")
+				return ctrl.Result{}, err
+			}
+			logger.Info("Policy created. Yielding thread to allow Liqo webhooks to register.", "namespace", namespaceName)
+		} else {
+			logger.Info("[DRY RUN] Would create NamespaceOffloading", "namespace", namespaceName)
 		}
 
-		// SYNCHRONOUS CONTEXT-AWARE BACKOFF
-		// Yield the thread briefly to allow Liqo's mutating webhooks to process the new CR.
-		logger.Info("Policy created. Yielding thread to allow Liqo webhooks to register.", "namespace", namespace, "backoff", r.BackoffDuration)
-
+		// Yield to Liqo's mutating webhooks and asynchronous scheduling logic.
+		// The context-aware wait allows shutdown to interrupt the delay cleanly.
 		select {
 		case <-time.After(r.BackoffDuration):
-			// The backoff period has elapsed, proceed with pod deletion.
 		case <-ctx.Done():
-			// Kubernetes sent a shutdown signal during our wait, exit cleanly.
-			logger.Info("Reconciliation cancelled by cluster during backoff")
 			return ctrl.Result{}, ctx.Err()
 		}
-
 	} else if err != nil {
 		logger.Error(err, "Failed to fetch NamespaceOffloading policy")
 		return ctrl.Result{}, err
-	} else if lastRemediation := offloadCR.GetAnnotations()[lastRemediationAnnotation]; lastRemediation != "" {
-		// Prevent infinite loops by honoring a cool-down period between remediation attempts.
-		remediationTime, parseErr := time.Parse(time.RFC3339Nano, lastRemediation)
-		if parseErr == nil {
-			remaining := r.BackoffDuration - time.Since(remediationTime)
-			if remaining > 0 {
-				logger.V(1).Info("Remediation backoff is active", "namespace", namespace, "remaining", remaining.Round(time.Millisecond))
-				return ctrl.Result{RequeueAfter: remaining}, nil
-			}
-		}
 	}
 
-	// 5. Physical Pod Deletion (Only if still trapped after sleep)
+	// Re-read the pod because Liqo may have recovered it during the backoff.
+	// Avoid annotating a pod that is no longer trapped.
 	var latestPod corev1.Pod
 	if err := r.Get(ctx, req.NamespacedName, &latestPod); err == nil {
-
-		// Verify if Liqo's background processes already auto-recovered the pod during the pause.
-		isStillTrapped := latestPod.Status.Reason == "OffloadingBackOff"
-		for _, cs := range latestPod.Status.ContainerStatuses {
-			if cs.State.Waiting != nil && cs.State.Waiting.Reason == "OffloadingBackOff" {
-				isStillTrapped = true
-			}
-		}
-		for _, cs := range latestPod.Status.InitContainerStatuses {
-			if cs.State.Waiting != nil && cs.State.Waiting.Reason == "OffloadingBackOff" {
-				isStillTrapped = true
-			}
-		}
-
-		if !isStillTrapped {
-			logger.Info("Pod successfully auto-recovered by Liqo during backoff. Skipping deletion.", "pod", podName)
+		if !isPodTrapped(&latestPod) {
+			logger.Info("Pod successfully auto-recovered by Liqo during backoff. Skipping edit.", "pod", podName)
 			return ctrl.Result{}, nil
 		}
 
-		// If it is still stuck, aggressively delete it to force the ReplicaSet/Deployment to spawn a fresh one.
-		deletePolicy := metav1.DeletePropagationBackground
-		deleteOpts := &client.DeleteOptions{
-			PropagationPolicy: &deletePolicy,
+		if !r.DryRun {
+			annotations := latestPod.GetAnnotations()
+			if annotations == nil {
+				annotations = make(map[string]string)
+			}
+			// The timestamp changes the pod object and asks downstream Liqo
+			// components to process a new synchronization attempt.
+			annotations[forceSyncAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
+			latestPod.SetAnnotations(annotations)
+
+			if err := r.Update(ctx, &latestPod); err != nil {
+				logger.Error(err, "Failed to edit the stuck pod for forced sync", "pod", podName)
+				return ctrl.Result{}, err
+			}
+
+			if err := r.persistRemediationBackoff(ctx, namespaceName); err != nil {
+				logger.Error(err, "Failed to persist namespace remediation backoff", "namespace", namespaceName)
+				return ctrl.Result{}, err
+			}
+			logger.Info("Successfully patched the stuck pod to trigger kubelet sync.", "pod", podName)
+		} else {
+			// Dry-run evaluates the same recovery path but does not create,
+			// update, or annotate any cluster resource.
+			logger.Info("[DRY RUN] Would patch the stuck pod with force-sync annotation", "pod", podName)
 		}
 
-		if err := r.Delete(ctx, &latestPod, deleteOpts); err != nil {
-			logger.Error(err, "Failed to delete the stuck pod", "pod", podName)
-			return ctrl.Result{}, err
-		}
-
-		if err := r.persistRemediationBackoff(ctx, namespace); err != nil {
-			logger.Error(err, "Failed to persist remediation backoff", "namespace", namespace)
-			return ctrl.Result{}, err
-		}
-
-		logger.Info("Successfully deleted the stuck pod. The controller will provision a replacement.", "pod", podName)
 	} else if !apierrors.IsNotFound(err) {
-		logger.Error(err, "Failed to fetch the latest pod status")
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
 }
 
-// Helper function to safely update the remediation timestamp using optimistic locking and retries.
+// isNamespaceAllowed applies namespace exclusions and label policy before
+// remediation can create or mutate cluster resources.
+func (r *LiqoTrapReconciler) isNamespaceAllowed(ns *corev1.Namespace) bool {
+	for _, pattern := range r.ExcludedNamespaces {
+		if matched, _ := filepath.Match(pattern, ns.Name); matched {
+			return false
+		}
+	}
+	for k, v := range r.BlacklistLabels {
+		if val, exists := ns.Labels[k]; exists && (v == "" || val == v) {
+			return false
+		}
+	}
+	if len(r.WhitelistLabels) > 0 {
+		for k, v := range r.WhitelistLabels {
+			if val, exists := ns.Labels[k]; !exists || (v != "" && val != v) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// persistRemediationBackoff safely records the remediation time using
+// optimistic-lock conflict retries. This preserves namespace metadata when
+// another controller or worker updates the object concurrently.
 func (r *LiqoTrapReconciler) persistRemediationBackoff(ctx context.Context, namespace string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &unstructured.Unstructured{}
-		latest.SetGroupVersionKind(schema.GroupVersionKind{
-			Group: "offloading.liqo.io", Version: "v1beta1", Kind: "NamespaceOffloading",
-		})
-		if err := r.Get(ctx, client.ObjectKey{Name: "offloading", Namespace: namespace}, latest); apierrors.IsNotFound(err) {
-			return nil
-		} else if err != nil {
+		var ns corev1.Namespace
+		if err := r.Get(ctx, client.ObjectKey{Name: namespace}, &ns); err != nil {
 			return err
 		}
 
-		annotations := latest.GetAnnotations()
+		annotations := ns.GetAnnotations()
 		if annotations == nil {
 			annotations = make(map[string]string)
 		}
 		annotations[lastRemediationAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
-		latest.SetAnnotations(annotations)
+		ns.SetAnnotations(annotations)
 
-		return r.Update(ctx, latest)
+		return r.Update(ctx, &ns)
 	})
 }
 
-// LiqoTrapPredicate allows all Create/Update events to pass through.
-// The actual filtering (Early Exit Pattern) happens safely inside the Reconcile loop.
-// Deletions are ignored as they require no remediation.
+// isPodTrapped checks the pod reason and both application and init-container
+// waiting states because Liqo may report OffloadingBackOff at any of them.
+func isPodTrapped(pod *corev1.Pod) bool {
+	if pod.Status.Reason == "OffloadingBackOff" {
+		return true
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason == "OffloadingBackOff" {
+			return true
+		}
+	}
+	for _, cs := range pod.Status.InitContainerStatuses {
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason == "OffloadingBackOff" {
+			return true
+		}
+	}
+	return false
+}
+
+// LiqoTrapPredicate filters pod events to current OffloadingBackOff states.
+// Delete events are ignored because a deleted pod no longer needs remediation.
 func LiqoTrapPredicate() predicate.Predicate {
 	return predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool { return true },
-		UpdateFunc: func(e event.UpdateEvent) bool { return true },
+		CreateFunc: func(e event.CreateEvent) bool {
+			pod, ok := e.Object.(*corev1.Pod)
+			return ok && isPodTrapped(pod)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			newPod, ok := e.ObjectNew.(*corev1.Pod)
+			return ok && isPodTrapped(newPod)
+		},
 		DeleteFunc: func(e event.DeleteEvent) bool { return false },
 	}
 }
 
+// SetupWithManager registers the reconciler for pod events and applies the
+// predicate before requests enter the controller work queue.
 func (r *LiqoTrapReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
