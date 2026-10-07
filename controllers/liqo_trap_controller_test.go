@@ -17,173 +17,254 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// Helper function to mock a Pod stuck in OffloadingBackOff state targeting a remote cluster.
+// Helper function to mock a Namespace with optional labels.
+func createNamespace(name string, labels map[string]string) *corev1.Namespace {
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	return &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+	}
+}
+
+// Helper function to mock a Pod stuck in OffloadingBackOff.
 func createStuckPod(name, namespace string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: corev1.PodSpec{
 			NodeSelector: map[string]string{"kubernetes.io/hostname": "cluster-remote"},
 		},
-		Status: corev1.PodStatus{
-			Reason: "OffloadingBackOff",
-		},
+		Status: corev1.PodStatus{Reason: "OffloadingBackOff"},
 	}
 }
 
-// Helper function to mock a pod that is undergoing graceful shutdown (terminating).
+// Helper function to mock a trapped Pod undergoing graceful shutdown.
 func createTerminatingPod(name, namespace string) *corev1.Pod {
 	now := metav1.Now()
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              name,
 			Namespace:         namespace,
-			DeletionTimestamp: &now, // Simulates graceful shutdown
+			DeletionTimestamp: &now,
 			Finalizers:        []string{"dummy-finalizer"},
 		},
-		Spec: corev1.PodSpec{
-			NodeSelector: map[string]string{"kubernetes.io/hostname": "cluster-remote"},
-		},
-		Status: corev1.PodStatus{
-			Reason: "OffloadingBackOff",
-		},
+		Spec:   corev1.PodSpec{NodeSelector: map[string]string{"kubernetes.io/hostname": "cluster-remote"}},
+		Status: corev1.PodStatus{Reason: "OffloadingBackOff"},
 	}
 }
 
-// Helper function to mock the NamespaceOffloading CR created by the trap reconciler.
+// Helper function to mock an existing NamespaceOffloading CR.
 func createTrapOffloadingCR(namespace string) *unstructured.Unstructured {
 	offloadCR := &unstructured.Unstructured{}
 	offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "offloading.liqo.io",
-		Version: "v1beta1",
-		Kind:    "NamespaceOffloading",
+		Group: "offloading.liqo.io", Version: "v1beta1", Kind: "NamespaceOffloading",
 	})
 	offloadCR.SetName("offloading")
 	offloadCR.SetNamespace(namespace)
-	// Assigned a fake UID to pass validation checks
 	offloadCR.SetUID(types.UID("mock-uid-trap"))
 	return offloadCR
 }
 
+// TestLiqoTrapReconciler_Reconcile verifies the complete remediation workflow:
+// creating a missing policy, allowing an existing policy to be reused,
+// respecting safety gates, preserving dry-run behavior, enforcing cooldowns,
+// and detecting OffloadingBackOff in nested container status.
 func TestLiqoTrapReconciler_Reconcile(t *testing.T) {
 	ctx := context.TODO()
-
-	// 1. Register core Kubernetes types to the test scheme
 	s := scheme.Scheme
-	if err := corev1.AddToScheme(s); err != nil {
-		t.Fatalf("Failed to add corev1 to scheme: %v", err)
-	}
+	_ = corev1.AddToScheme(s)
 
-	// 2. Define the trap matrix
-	// This ensures we test stuck pods, idempotency, system namespaces, and terminating pods.
 	tests := []struct {
 		name                string
 		namespace           string
 		podName             string
-		existingObjects     []client.Object // Pre-populate the cluster state
-		expectPolicyCreated bool            // Should the policy be generated
-		expectPodDeleted    bool            // Should the stuck pod be deleted
+		dryRun              bool
+		existingObjects     []client.Object
+		expectPolicyCreated bool
+		expectPodPatched    bool
 	}{
 		{
-			name:      "Happy Path: Creates policy, sleeps synchronously, deletes pod atomically",
+			// The primary recovery path creates the missing policy and applies
+			// force-sync to the still-trapped pod.
+			name:      "Happy Path: Creates policy and patches stuck pod",
 			namespace: "default",
 			podName:   "stuck-pod",
+			dryRun:    false,
 			existingObjects: []client.Object{
+				createNamespace("default", nil),
 				createStuckPod("stuck-pod", "default"),
 			},
 			expectPolicyCreated: true,
-			expectPodDeleted:    true,
+			expectPodPatched:    true,
 		},
 		{
-			name:      "Idempotency: Policy already exists, skips delay and deletes pod immediately",
+			// An existing policy proves reconciliation is idempotent and avoids
+			// recreating or unnecessarily waiting for the same resource.
+			name:      "Idempotency: Policy already exists, skips delay and patches pod",
 			namespace: "default",
 			podName:   "stuck-pod",
+			dryRun:    false,
 			existingObjects: []client.Object{
+				createNamespace("default", nil),
 				createStuckPod("stuck-pod", "default"),
 				createTrapOffloadingCR("default"),
 			},
 			expectPolicyCreated: true,
-			expectPodDeleted:    true,
+			expectPodPatched:    true,
 		},
 		{
-			name:      "Excluded Namespace: System namespace is ignored entirely",
-			namespace: "kube-system",
-			podName:   "system-pod",
-			existingObjects: []client.Object{
-				createStuckPod("system-pod", "kube-system"),
-			},
-			expectPolicyCreated: false, // Critical systems must not be offloaded automatically
-			expectPodDeleted:    false,
-		},
-		{
+			// Terminating pods are already leaving the cluster and must not be
+			// modified or used to start another remediation cycle.
 			name:      "Terminating Pod: Early exit prevents hot-loops on dying pods",
 			namespace: "default",
 			podName:   "dying-pod",
+			dryRun:    false,
 			existingObjects: []client.Object{
+				createNamespace("default", nil),
 				createTerminatingPod("dying-pod", "default"),
 			},
-			expectPolicyCreated: false, // Dying pods shouldn't trigger new offloading policies
-			expectPodDeleted:    false, // Wait for complete deletion organically
+			expectPolicyCreated: false,
+			expectPodPatched:    false,
+		},
+		{
+			// Dry-run must execute the decision path while leaving both the
+			// NamespaceOffloading policy and pod annotations unchanged.
+			name:      "Dry Run: Evaluates logic but does not modify state",
+			namespace: "default",
+			podName:   "stuck-pod",
+			dryRun:    true,
+			existingObjects: []client.Object{
+				createNamespace("default", nil),
+				createStuckPod("stuck-pod", "default"),
+			},
+			expectPolicyCreated: false,
+			expectPodPatched:    false,
+		},
+		{
+			// Glob-based exclusions protect system namespaces from automatic
+			// policy creation and pod mutation.
+			name:      "Glob Exclusion: Matches pattern *-system",
+			namespace: "kube-system",
+			podName:   "system-pod",
+			dryRun:    false,
+			existingObjects: []client.Object{
+				createNamespace("kube-system", nil),
+				createStuckPod("system-pod", "kube-system"),
+			},
+			expectPolicyCreated: false,
+			expectPodPatched:    false,
+		},
+		{
+			// Namespace blacklist labels provide an operator-controlled safety
+			// gate for workloads that must not be remediated.
+			name:      "Label Exclusion: Namespace has excluded label",
+			namespace: "test-ns",
+			podName:   "stuck-pod",
+			dryRun:    false,
+			existingObjects: []client.Object{
+				createNamespace("test-ns", map[string]string{"no-trap": "true"}),
+				createStuckPod("stuck-pod", "test-ns"),
+			},
+			expectPolicyCreated: false,
+			expectPodPatched:    false,
+		},
+
+		{
+			// A recent remediation timestamp must defer the request so repeated
+			// trapped pods cannot create a remediation hot-loop.
+			name:      "Backoff Active: Requeues if remediation was too recent",
+			namespace: "default",
+			podName:   "stuck-pod",
+			dryRun:    false,
+			existingObjects: []client.Object{
+				&corev1.Namespace{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "default",
+						Annotations: map[string]string{
+							lastRemediationAnnotation: time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano),
+						},
+					},
+				},
+				createStuckPod("stuck-pod", "default"),
+			},
+			expectPolicyCreated: false,
+			expectPodPatched:    false,
+		},
+
+		{
+			// Liqo can report the trapped state on an individual container even
+			// when the pod-level reason is empty.
+			name:      "Container Trapped: Detects OffloadingBackOff deep in ContainerStatuses",
+			namespace: "default",
+			podName:   "container-stuck-pod",
+			dryRun:    false,
+			existingObjects: []client.Object{
+				createNamespace("default", nil),
+				&corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: "container-stuck-pod", Namespace: "default"},
+					Spec:       corev1.PodSpec{NodeSelector: map[string]string{"kubernetes.io/hostname": "cluster-remote"}},
+					Status: corev1.PodStatus{
+						Reason: "",
+						ContainerStatuses: []corev1.ContainerStatus{
+							{
+								State: corev1.ContainerState{
+									Waiting: &corev1.ContainerStateWaiting{Reason: "OffloadingBackOff"},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectPolicyCreated: true,
+			expectPodPatched:    true,
 		},
 	}
 
-	// 3. Run the Scenarios
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Initialize the fake client running entirely in-memory
-			fakeClient := fake.NewClientBuilder().
-				WithScheme(s).
-				WithObjects(tt.existingObjects...).
-				Build()
+			// Initialize an isolated in-memory API so resource mutations from one
+			// scenario cannot affect any other remediation case.
+			fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(tt.existingObjects...).Build()
 
 			reconciler := &LiqoTrapReconciler{
-				Client:         fakeClient,
-				TargetClusters: []string{"cluster-remote"}, // Dynamically injected parameter
-				ExcludedNamespaces: map[string]bool{ // Dynamically injected parameter
-					"kube-system":        true,
-					"liqo-system":        true,
-					"local-path-storage": true,
-					"crownlabs-system":   true,
-				},
-				BackoffDuration: 2 * time.Second,
+				Client:             fakeClient,
+				TargetClusters:     []string{"cluster-remote"},
+				ExcludedNamespaces: []string{"*-system", "local-path-storage"},
+				BlacklistLabels:    map[string]string{"no-trap": "true"},
+				BackoffDuration:    10 * time.Millisecond,
+				DryRun:             tt.dryRun,
 			}
 
-			// Trigger the Reconcile loop targeting our stuck pod
-			req := ctrl.Request{
-				NamespacedName: types.NamespacedName{
-					Name:      tt.podName,
-					Namespace: tt.namespace,
-				},
-			}
-
-			res, err := reconciler.Reconcile(ctx, req)
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: tt.podName, Namespace: tt.namespace}}
+			_, err := reconciler.Reconcile(ctx, req)
 			if err != nil {
-				t.Fatalf("Reconcile returned an unexpected error: %v", err)
+				t.Fatalf("Unexpected error: %v", err)
 			}
 
-			if res.RequeueAfter != 0 {
-				t.Errorf("Expected RequeueAfter 0, got %v", res.RequeueAfter)
-			}
-
-			// 4. Assertions: Verify if the NamespaceOffloading was created and the pod deleted
+			// Verify whether remediation created or preserved the policy expected
+			// for this scenario.
 			checkCR := &unstructured.Unstructured{}
-			checkCR.SetGroupVersionKind(schema.GroupVersionKind{
-				Group:   "offloading.liqo.io",
-				Version: "v1beta1",
-				Kind:    "NamespaceOffloading",
-			})
-
+			checkCR.SetGroupVersionKind(schema.GroupVersionKind{Group: "offloading.liqo.io", Version: "v1beta1", Kind: "NamespaceOffloading"})
 			err = fakeClient.Get(ctx, types.NamespacedName{Name: "offloading", Namespace: tt.namespace}, checkCR)
+
 			if tt.expectPolicyCreated && apierrors.IsNotFound(err) {
-				t.Errorf("Expected NamespaceOffloading to exist, but it was not found")
+				t.Errorf("Expected NamespaceOffloading to exist")
 			} else if !tt.expectPolicyCreated && err == nil {
-				t.Errorf("Expected NO NamespaceOffloading, but one was created")
+				if tt.name != "Idempotency: Policy already exists, skips delay and patches pod" {
+					t.Errorf("Expected NO NamespaceOffloading creation")
+				}
 			}
 
-			err = fakeClient.Get(ctx, types.NamespacedName{Name: tt.podName, Namespace: tt.namespace}, &corev1.Pod{})
-			if tt.expectPodDeleted && err == nil {
-				t.Errorf("Expected Pod to be deleted, but it still exists")
-			} else if !tt.expectPodDeleted && apierrors.IsNotFound(err) {
-				t.Errorf("Expected Pod to remain, but it was deleted")
+			var pod corev1.Pod
+			_ = fakeClient.Get(ctx, types.NamespacedName{Name: tt.podName, Namespace: tt.namespace}, &pod)
+
+			// The force-sync annotation is the observable pod mutation used to
+			// request another Liqo synchronization attempt.
+			hasPatch := pod.GetAnnotations()[forceSyncAnnotation] != ""
+			if tt.expectPodPatched && !hasPatch {
+				t.Errorf("Expected Pod to be patched with force-sync annotation")
+			} else if !tt.expectPodPatched && hasPatch {
+				t.Errorf("Expected Pod NOT to be patched")
 			}
 		})
 	}

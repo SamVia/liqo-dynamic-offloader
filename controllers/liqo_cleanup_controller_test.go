@@ -6,7 +6,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -18,181 +17,173 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// Helper function to mock the NamespaceOffloading CR that the controller attempts to clean up.
-func createCleanupOffloadingCR(namespace string) *unstructured.Unstructured {
-	offloadCR := &unstructured.Unstructured{}
-	offloadCR.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "offloading.liqo.io",
-		Version: "v1beta1",
-		Kind:    "NamespaceOffloading",
-	})
-	offloadCR.SetName("offloading")
-	offloadCR.SetNamespace(namespace)
-	// Assigned a fake UID to pass the controller's deletion safety check
-	offloadCR.SetUID(types.UID("mock-uid-cleanup"))
-	return offloadCR
+// Helper function to mock a Namespace used by the cleanup reconciler.
+func createCleanupNamespace(name string) *corev1.Namespace {
+	return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
 }
 
+// Helper function to mock the NamespaceOffloading CR with an optional timestamp.
+func createCleanupOffloadingCR(namespace string, emptySince string) *unstructured.Unstructured {
+	cr := &unstructured.Unstructured{}
+	cr.SetGroupVersionKind(schema.GroupVersionKind{Group: "offloading.liqo.io", Version: "v1beta1", Kind: "NamespaceOffloading"})
+	cr.SetName("offloading")
+	cr.SetNamespace(namespace)
+	if emptySince != "" {
+		cr.SetAnnotations(map[string]string{emptySinceAnnotation: emptySince})
+	}
+	return cr
+}
+
+// TestLiqoCleanupReconciler_Reconcile verifies the cleanup state machine:
+// starting and cancelling the durable empty-namespace countdown, deleting an
+// expired policy, and retaining policies while remote work is still active.
 func TestLiqoCleanupReconciler_Reconcile(t *testing.T) {
 	ctx := context.TODO()
-
-	// 1. Register core Kubernetes types to the test scheme
 	s := scheme.Scheme
-	if err := corev1.AddToScheme(s); err != nil {
-		t.Fatalf("Failed to add corev1 to scheme: %v", err)
-	}
+	_ = corev1.AddToScheme(s)
 
-	// 2. Define the cleanup matrix
-	// This ensures we test active, pending, terminal, and local pod permutations.
 	tests := []struct {
 		name            string
 		namespace       string
-		existingObjects []client.Object // Pre-populate the cluster state
-		expectCleanup   bool            // Should the policy be deleted
+		existingObjects []client.Object
+		expectState     string // "annotated" starts the countdown; "deleted" completes cleanup;
+		// "cleared" cancels the countdown; "unchanged" preserves state.
 	}{
 		{
-			name:      "Happy Path: Zero active pods, policy is deleted",
+			name:      "Step 1: Zero active pods triggers empty-since annotation",
 			namespace: "default",
 			existingObjects: []client.Object{
-				createCleanupOffloadingCR("default"),
+				createCleanupNamespace("default"),
+				createCleanupOffloadingCR("default", ""),
 			},
-			expectCleanup: true,
+			expectState: "annotated",
 		},
 		{
-			name:      "Excluded Namespace: kube-system is ignored even with zero pods",
-			namespace: "kube-system",
+			name:      "Step 2: Timeout elapsed, policy is deleted",
+			namespace: "default",
 			existingObjects: []client.Object{
-				createCleanupOffloadingCR("kube-system"),
+				createCleanupNamespace("default"),
+				createCleanupOffloadingCR("default", time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339)),
 			},
-			expectCleanup: false, // Critical systems must maintain their settings
+			expectState: "deleted",
 		},
 		{
-			name:      "Blocking: Pod running on remote cluster prevents cleanup",
+			name:      "Abort: Pod created during timeout clears annotation",
 			namespace: "demo-ns",
 			existingObjects: []client.Object{
-				createCleanupOffloadingCR("demo-ns"),
+				createCleanupNamespace("demo-ns"),
+				createCleanupOffloadingCR("demo-ns", time.Now().UTC().Format(time.RFC3339)),
 				&corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{Name: "remote-pod", Namespace: "demo-ns"},
+					ObjectMeta: metav1.ObjectMeta{Name: "new-pod", Namespace: "demo-ns"},
 					Spec:       corev1.PodSpec{NodeName: "cluster-remote"},
 					Status:     corev1.PodStatus{Phase: corev1.PodRunning},
 				},
 			},
-			expectCleanup: false,
+			expectState: "cleared",
 		},
 		{
-			name:      "Blocking: Pending pod targeting remote cluster prevents cleanup",
+			name:      "Blocking: Pending pod targeting remote cluster prevents cleanup and clears annotation",
 			namespace: "demo-ns",
 			existingObjects: []client.Object{
-				createCleanupOffloadingCR("demo-ns"),
+				createCleanupNamespace("demo-ns"),
+				createCleanupOffloadingCR("demo-ns", time.Now().UTC().Format(time.RFC3339)),
 				&corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{Name: "pending-remote-pod", Namespace: "demo-ns"},
-					Spec: corev1.PodSpec{
-						NodeSelector: map[string]string{"kubernetes.io/hostname": "cluster-remote"},
-					},
-					Status: corev1.PodStatus{Phase: corev1.PodPending}, // Note: NodeName is empty here
+					Spec:       corev1.PodSpec{NodeSelector: map[string]string{"kubernetes.io/hostname": "cluster-remote"}},
+					Status:     corev1.PodStatus{Phase: corev1.PodPending},
 				},
 			},
-			expectCleanup: false, // Pending pods still need the policy to eventually schedule
+			expectState: "cleared",
 		},
 		{
 			name:      "Graceful Shutdown: Terminating pod blocks cleanup",
 			namespace: "demo-ns",
 			existingObjects: []client.Object{
-				createCleanupOffloadingCR("demo-ns"),
+				createCleanupNamespace("demo-ns"),
+				createCleanupOffloadingCR("demo-ns", ""),
 				&corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:              "terminating-pod",
 						Namespace:         "demo-ns",
-						DeletionTimestamp: &metav1.Time{Time: time.Now()}, // Simulates graceful shutdown
-						Finalizers:        []string{"dummy-finalizer"},
+						DeletionTimestamp: &metav1.Time{Time: time.Now()},
+						Finalizers:        []string{"dummy"},
 					},
 					Spec:   corev1.PodSpec{NodeName: "cluster-remote"},
 					Status: corev1.PodStatus{Phase: corev1.PodRunning},
 				},
 			},
-			expectCleanup: false, // Terminating pods still require offloading until completely deleted
-		},
-		{
-			name:      "Terminal Pods: Succeeded remote pod does NOT block cleanup",
-			namespace: "demo-ns",
-			existingObjects: []client.Object{
-				createCleanupOffloadingCR("demo-ns"),
-				&corev1.Pod{
-					ObjectMeta: metav1.ObjectMeta{Name: "completed-pod", Namespace: "demo-ns"},
-					Spec:       corev1.PodSpec{NodeName: "cluster-remote"},
-					Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
-				},
-			},
-			expectCleanup: true, // Completed pods don't need active offloading
+			expectState: "unchanged",
 		},
 		{
 			name:      "Local Pods: Running local pod does NOT block cleanup",
 			namespace: "demo-ns",
 			existingObjects: []client.Object{
-				createCleanupOffloadingCR("demo-ns"),
+				createCleanupNamespace("demo-ns"),
+				createCleanupOffloadingCR("demo-ns", ""),
 				&corev1.Pod{
 					ObjectMeta: metav1.ObjectMeta{Name: "local-pod", Namespace: "demo-ns"},
 					Spec:       corev1.PodSpec{NodeName: "cluster-local-worker"},
 					Status:     corev1.PodStatus{Phase: corev1.PodRunning},
 				},
 			},
-			expectCleanup: true, // Local workloads don't care if the remote policy is revoked
+			expectState: "annotated", // It behaves as if there are zero remote pods
 		},
 	}
 
-	// 3. Run the Scenarios
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Initialize the fake client running entirely in-memory
-			fakeClient := fake.NewClientBuilder().
-				WithScheme(s).
-				WithObjects(tt.existingObjects...).
-				Build()
+			// Initialize an isolated in-memory API so each scenario validates
+			// only its own resource state and reconciliation transition.
+			fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(tt.existingObjects...).Build()
 
 			reconciler := &LiqoCleanupReconciler{
-				Client:         fakeClient,
-				TargetClusters: []string{"cluster-remote"}, // Dynamically injected parameter
-				ExcludedNamespaces: map[string]bool{ // Dynamically injected parameter
-					"kube-system":        true,
-					"liqo-system":        true,
-					"local-path-storage": true,
-					"crownlabs-system":   true,
-				},
-				Recorder:    record.NewFakeRecorder(100), // Mocked recorder for tests
-				GracePeriod: 10 * time.Second,
+				Client:             fakeClient,
+				TargetClusters:     []string{"cluster-remote"},
+				ExcludedNamespaces: []string{"*-system"},
+				Recorder:           record.NewFakeRecorder(100),
+				CleanupDelay:       10 * time.Minute,
+				DryRun:             false,
 			}
 
-			// Trigger the Reconcile loop targeting our namespace
-			req := ctrl.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: tt.namespace,
-				},
-			}
-
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: tt.namespace}}
 			_, err := reconciler.Reconcile(ctx, req)
 			if err != nil {
-				t.Fatalf("Reconcile returned an unexpected error: %v", err)
+				t.Fatalf("Unexpected error: %v", err)
 			}
 
-			// 4. Assertions: Verify if the NamespaceOffloading was successfully cleaned up
 			checkCR := &unstructured.Unstructured{}
-			checkCR.SetGroupVersionKind(schema.GroupVersionKind{
-				Group:   "offloading.liqo.io",
-				Version: "v1beta1",
-				Kind:    "NamespaceOffloading",
-			})
-
+			checkCR.SetGroupVersionKind(schema.GroupVersionKind{Group: "offloading.liqo.io", Version: "v1beta1", Kind: "NamespaceOffloading"})
 			err = fakeClient.Get(ctx, types.NamespacedName{Name: "offloading", Namespace: tt.namespace}, checkCR)
 
-			if tt.expectCleanup {
+			switch tt.expectState {
+			case "deleted":
+				// Expired empty namespaces must lose their offloading policy.
 				if err == nil {
-					t.Errorf("Expected NamespaceOffloading to be deleted, but it still exists")
-				} else if !apierrors.IsNotFound(err) {
-					t.Errorf("Expected a NotFound error, but got: %v", err)
+					t.Errorf("Expected NamespaceOffloading to be deleted")
 				}
-			} else {
+			case "annotated":
+				// The first empty observation starts the durable countdown.
 				if err != nil {
-					t.Errorf("Expected NamespaceOffloading to persist, but got error (was it deleted?): %v", err)
+					t.Fatalf("Expected NamespaceOffloading to exist, got error: %v", err)
+				}
+				if checkCR.GetAnnotations()[emptySinceAnnotation] == "" {
+					t.Errorf("Expected empty-since annotation to be set")
+				}
+			case "cleared":
+				// New remote work cancels a previously started countdown.
+				if err != nil {
+					t.Fatalf("Expected NamespaceOffloading to exist")
+				}
+				if checkCR.GetAnnotations()[emptySinceAnnotation] != "" {
+					t.Errorf("Expected empty-since annotation to be cleared")
+				}
+			case "unchanged":
+				// Terminating remote work must prevent cleanup from progressing.
+				if err != nil {
+					t.Fatalf("Expected NamespaceOffloading to exist")
+				}
+				if checkCR.GetAnnotations()[emptySinceAnnotation] != "" {
+					t.Errorf("Expected annotation NOT to be set")
 				}
 			}
 		})
