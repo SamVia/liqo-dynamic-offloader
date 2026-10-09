@@ -25,6 +25,8 @@ func main() {
 	var trapBackoff time.Duration
 	var cleanupDelay time.Duration
 	var dryRun bool
+	var enableTrap bool
+	var enableCleanup bool
 
 	flag.StringVar(&targetClusterIDs, "target-cluster-ids", "", "Comma-separated list of Target Cluster IDs. Empty delegates to Liqo.")
 	flag.StringVar(&excludedNamespaces, "excluded-namespaces", "kube-system,liqo-system", "Comma-separated list of namespaces to exclude (supports glob expressions like *-system).")
@@ -39,6 +41,8 @@ func main() {
 	flag.DurationVar(&trapBackoff, "trap-backoff", 2*time.Second, "Wait duration before verifying stuck pod.")
 	flag.DurationVar(&cleanupDelay, "cleanup-delay", 10*time.Second, "Delay before cleaning up an empty offloading policy. Set to 0 to disable.")
 	flag.BoolVar(&dryRun, "dry-run", false, "Enable dry-run mode to log actions without modifying cluster state.")
+	flag.BoolVar(&enableTrap, "enable-trap", true, "Enable the LiqoTrap controller (auto-offloading of stuck pods).")
+	flag.BoolVar(&enableCleanup, "enable-cleanup", true, "Enable the LiqoCleanup controller (auto-removal of idle offloading policies).")
 
 	opts := zap.Options{
 		Development: true,
@@ -66,40 +70,49 @@ func main() {
 	targetClusters := parseCSV(targetClusterIDs)
 	excludedNsList := parseCSV(excludedNamespaces)
 
-	// Register the Trap reconciler with its independent policy configuration.
-	// Both reconcilers use the manager client and cache, but maintain separate
-	// filters and mutation policies.
-	if err = (&controllers.LiqoTrapReconciler{
-		Client:             mgr.GetClient(),
-		TargetClusters:     targetClusters,
-		ExcludedNamespaces: excludedNsList,
-		WhitelistLabels:    parseLabels(trapWhitelist),
-		BlacklistLabels:    parseLabels(trapBlacklist),
-		BackoffDuration:    trapBackoff,
-		DryRun:             dryRun,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "LiqoTrap")
-		os.Exit(1)
+	// Register the Trap reconciler only when enabled.
+	if enableTrap {
+		if err = (&controllers.LiqoTrapReconciler{
+			Client:             mgr.GetClient(),
+			TargetClusters:     targetClusters,
+			ExcludedNamespaces: excludedNsList,
+			WhitelistLabels:    parseLabels(trapWhitelist),
+			BlacklistLabels:    parseLabels(trapBlacklist),
+			BackoffDuration:    trapBackoff,
+			DryRun:             dryRun,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "LiqoTrap")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("LiqoTrap controller is disabled (--enable-trap=false)")
 	}
 
-	if err = (&controllers.LiqoCleanupReconciler{
-		Client:             mgr.GetClient(),
-		TargetClusters:     targetClusters,
-		ExcludedNamespaces: excludedNsList,
-		WhitelistLabels:    parseLabels(cleanupWhitelist),
-		BlacklistLabels:    parseLabels(cleanupBlacklist),
-		Recorder:           mgr.GetEventRecorderFor("liqo-cleanup"),
-		CleanupDelay:       cleanupDelay,
-		DryRun:             dryRun,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "LiqoCleanup")
-		os.Exit(1)
+	// Register the Cleanup reconciler only when enabled.
+	if enableCleanup {
+		if err = (&controllers.LiqoCleanupReconciler{
+			Client:             mgr.GetClient(),
+			TargetClusters:     targetClusters,
+			ExcludedNamespaces: excludedNsList,
+			WhitelistLabels:    parseLabels(cleanupWhitelist),
+			BlacklistLabels:    parseLabels(cleanupBlacklist),
+			Recorder:           mgr.GetEventRecorderFor("liqo-cleanup"),
+			CleanupDelay:       cleanupDelay,
+			DryRun:             dryRun,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "LiqoCleanup")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("LiqoCleanup controller is disabled (--enable-cleanup=false)")
 	}
 
 	// Log the effective startup configuration for operational diagnostics.
 	// Sensitive credentials are not included; only controller policy values are
 	// reported.
 	setupLog.Info("Starting controller",
+		"EnableTrap", enableTrap,
+		"EnableCleanup", enableCleanup,
 		"TargetClusters", targetClusters,
 		"ExcludedNamespaces", excludedNsList,
 		"TrapWhitelist", trapWhitelist,

@@ -69,6 +69,8 @@ The operator is configured at startup through command-line flags. The Helm chart
 | `--cleanup-blacklist-labels` | Namespace `key=value` labels that disable Cleanup. | *(empty)* |
 | `--trap-backoff` | Wait duration before rechecking a trapped pod. | `2s` |
 | `--cleanup-delay` | Countdown before deleting an empty offloading policy. `0` disables automatic cleanup. | `10s` |
+| `--enable-trap` | Enables the LiqoTrap controller (auto-offloading of trapped pods). | `true` |
+| `--enable-cleanup` | Enables the LiqoCleanup controller (auto-removal of empty offloading policies). | `true` |
 | `--dry-run` | Logs intended actions without modifying cluster state. | `false` |
 
 ### High Availability

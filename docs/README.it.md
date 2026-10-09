@@ -68,6 +68,8 @@ L'operatore viene configurato all'avvio tramite flag della riga di comando. Il c
 | `--cleanup-blacklist-labels` | Label `key=value` che disabilitano il Cleanup Controller sul namespace. | *(vuoto)* |
 | `--trap-backoff` | Durata dell'attesa prima di ricontrollare un pod bloccato. | `2s` |
 | `--cleanup-delay` | Conto alla rovescia prima di eliminare una policy vuota. `0` disabilita la pulizia automatica. | `10s` |
+| `--enable-trap` | Abilita il controller LiqoTrap (auto-offloading dei pod bloccati). | `true` |
+| `--enable-cleanup` | Abilita il controller LiqoCleanup (rimozione automatica delle policy vuote). | `true` |
 | `--dry-run` | Registra le azioni previste senza modificare lo stato del cluster. | `false` |
 
 ### High Availability

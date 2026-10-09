@@ -41,6 +41,8 @@ spec:
         - "--cleanup-blacklist-labels={{ .Values.config.cleanupBlacklistLabels }}"
         - "--trap-backoff={{ .Values.config.trapBackoff }}"
         - "--cleanup-delay={{ .Values.config.cleanupDelay }}"
+        - "--enable-trap={{ .Values.config.enableTrap }}"
+        - "--enable-cleanup={{ .Values.config.enableCleanup }}"
         {{- if .Values.config.dryRun }}
         - "--dry-run"
         {{- end }}

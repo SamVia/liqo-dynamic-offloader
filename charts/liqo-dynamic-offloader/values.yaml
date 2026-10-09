@@ -38,6 +38,8 @@ config:
   cleanupBlacklistLabels: ""
   trapBackoff: "2s"
   cleanupDelay: "10s"
+  enableTrap: true
+  enableCleanup: true
   dryRun: false
 
 resources:
