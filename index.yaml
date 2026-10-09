@@ -3,6 +3,20 @@ entries:
   liqo-dynamic-offloader:
   - apiVersion: v2
     appVersion: 0.1.0
+    created: "2026-10-09T14:20:50.676304958Z"
+    description: Event-driven Kubernetes operator for automatic recovery of Liqo offloading.
+    digest: 2825db56e578fdb7c5f0c07a7ec138c27c6f53f335972a2743382db05da996f5
+    keywords:
+    - kubernetes
+    - liqo
+    - operator
+    name: liqo-dynamic-offloader
+    type: application
+    urls:
+    - https://github.com/SamVia/liqo-dynamic-offloader/releases/download/liqo-dynamic-offloader-0.1.2/liqo-dynamic-offloader-0.1.2.tgz
+    version: 0.1.2
+  - apiVersion: v2
+    appVersion: 0.1.0
     created: "2026-10-08T13:10:18.573352152Z"
     description: Event-driven Kubernetes operator for automatic recovery of Liqo offloading.
     digest: 7dbd96c27f48365e3d112267ba57b66e157d1daeee9570fb43a83769d7059264
@@ -15,4 +29,4 @@ entries:
     urls:
     - https://github.com/SamVia/liqo-dynamic-offloader/releases/download/liqo-dynamic-offloader-0.1.1/liqo-dynamic-offloader-0.1.1.tgz
     version: 0.1.1
-generated: "2026-10-08T13:10:18.573357842Z"
+generated: "2026-10-09T14:20:50.67631921Z"
