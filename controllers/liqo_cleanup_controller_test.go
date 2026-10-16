@@ -35,7 +35,7 @@ func createCleanupOffloadingCR(namespace string, emptySince string) *unstructure
 }
 
 // TestLiqoCleanupReconciler_Reconcile verifies the cleanup state machine:
-// starting and cancelling the durable empty-namespace countdown, deleting an
+// starting and canceling the durable empty-namespace countdown, deleting an
 // expired policy, and retaining policies while remote work is still active.
 func TestLiqoCleanupReconciler_Reconcile(t *testing.T) {
 	ctx := context.TODO()

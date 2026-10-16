@@ -194,7 +194,7 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				if err := r.Update(ctx, offloadCR); err != nil {
 					return ctrl.Result{}, err
 				}
-				logger.Info("New remote pods detected. Cancelled cleanup countdown.", "namespace", namespace)
+				logger.Info("New remote pods detected. Canceled cleanup countdown.", "namespace", namespace)
 			} else {
 				logger.Info("[DRY RUN] Would remove empty-since annotation", "namespace", namespace)
 			}
