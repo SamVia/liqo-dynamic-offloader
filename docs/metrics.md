@@ -10,6 +10,7 @@ These custom metrics are emitted directly by the operator and are perfect for de
 
 | Metric | Type | What it tracks & Why it matters |
 | --- | --- | --- |
+| `liqo_trap_offloadings_created_total` | Counter | Total offloading policies successfully created by the Trap Controller. Proves that pods trapped in OffloadingBackOff are dynamically remediated. |
 | `liqo_cleanup_namespaces_total` | Counter | Total offloading policies successfully revoked. A rising count during a demo visually proves that isolated namespaces are being automatically restored. |
 | `liqo_cleanup_active_remote_pods` | Gauge | Current remote (or gracefully terminating) pods per namespace. Drops to `0` exactly when the cleanup controller tears down the policy. |
 
