@@ -34,7 +34,7 @@ issues:
   max-same-issues: 0
   exclude-rules:
     # Test files may declare helper variables that are not always read by every test case.
-    - path: "_test\.go"
+    - path: '_test\.go'
       linters:
         - unparam
         - unused
