@@ -1,6 +1,7 @@
 # Image URL to use all building/pushing image targets
 IMG ?= liqo-dynamic-offloader:latest
 CONTROLLER_GEN ?= ./bin/controller-gen
+GOLANGCILINT ?= ./bin/golangci-lint
 CHART ?= charts/liqo-dynamic-offloader
 HELM_RELEASE ?= liqo-dynamic-offloader
 HELM_NAMESPACE ?= liqo-system
@@ -20,8 +21,16 @@ fmt: ## Run go fmt against code
 vet: ## Run go vet against code
 	go vet ./...
 
+.PHONY: lint
+lint: ## Run golangci-lint against code
+	@if [ ! -f $(GOLANGCILINT) ]; then \
+		echo "Installing golangci-lint..."; \
+		curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b ./bin latest; \
+	fi
+	$(GOLANGCILINT) run ./...
+
 .PHONY: test
-test: manifests fmt vet ## Run tests
+test: manifests fmt vet lint ## Run tests
 	go test -v ./...
 
 .PHONY: build

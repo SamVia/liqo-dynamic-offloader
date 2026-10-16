@@ -22,7 +22,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          # Read the Go version from go.mod so the CI always matches the project.
+          go-version-file: go.mod
 
       - name: Verify dependencies
         run: go mod verify
@@ -35,6 +36,27 @@ jobs:
 
       - name: Build binary
         run: go build -o bin/manager main.go
+
+  go-lint:
+    name: Lint Go Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Read the Go version from go.mod so the CI always matches the project.
+          go-version-file: go.mod
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          # latest picks the newest stable release automatically.
+          # Pin to a specific version (e.g. v1.59.1) if you ever need stricter
+          # reproducibility or need to work around a regression.
+          version: latest
 
   helm-lint:
     name: Lint Helm Chart
