@@ -24,7 +24,9 @@ linters:
 linters-settings:
   errcheck:
     check-blank: false
-    ignore: "fmt:.*,io:Close"
+    exclude-functions:
+      - "fmt:.*"
+      - "io:Close"
   gofmt:
     simplify: true
   misspell:
