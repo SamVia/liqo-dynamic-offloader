@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -15,14 +16,30 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
+
+// Metrics for Prometheus.
+var (
+	liqoTrapOffloadingsCreatedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "liqo_trap_offloadings_created_total",
+			Help: "Total number of NamespaceOffloading policies successfully created by the trap controller",
+		},
+	)
+)
+
+func init() {
+	metrics.Registry.MustRegister(liqoTrapOffloadingsCreatedTotal)
+}
 
 // LiqoTrapReconciler watches for Pods stuck in OffloadingBackOff and
 // provisions the NamespaceOffloading policy required to rescue them.
 type LiqoTrapReconciler struct {
 	client.Client
 	TargetClusters     []string
+	AllowedNamespaces  []string
 	ExcludedNamespaces []string
 	WhitelistLabels    map[string]string
 	BlacklistLabels    map[string]string
@@ -50,14 +67,22 @@ const forceSyncAnnotation = "dynamic-offloader.liqo.io/force-sync"
 func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	namespaceName := req.Namespace
+	if namespaceName == "" {
+		namespaceName = req.Name
+	}
 	podName := req.Name
+
+	// Fail fast: validate namespace name patterns BEFORE any API server Get
+	if !r.isNamespaceNameAllowed(namespaceName) {
+		return ctrl.Result{}, nil
+	}
 
 	var ns corev1.Namespace
 	if err := r.Get(ctx, client.ObjectKey{Name: namespaceName}, &ns); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if !r.isNamespaceAllowed(&ns) {
+	if !r.isNamespaceLabelsAllowed(&ns) {
 		// Protected namespaces must never be changed by automatic remediation.
 		return ctrl.Result{}, nil
 	}
@@ -129,6 +154,7 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return ctrl.Result{}, err
 			}
 			logger.Info("Policy created. Yielding thread to allow Liqo webhooks to register.", "namespace", namespaceName)
+			liqoTrapOffloadingsCreatedTotal.Inc()
 		} else {
 			logger.Info("[DRY RUN] Would create NamespaceOffloading", "namespace", namespaceName)
 		}
@@ -187,14 +213,32 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return ctrl.Result{}, nil
 }
 
-// isNamespaceAllowed applies namespace exclusions and label policy before
-// remediation can create or mutate cluster resources.
-func (r *LiqoTrapReconciler) isNamespaceAllowed(ns *corev1.Namespace) bool {
+// isNamespaceNameAllowed evaluates globbing patterns on the namespace name
+// BEFORE issuing any API server calls. If an exclusion pattern matches or if
+// an inclusion pattern is defined and not matched, it returns false.
+func (r *LiqoTrapReconciler) isNamespaceNameAllowed(namespaceName string) bool {
 	for _, pattern := range r.ExcludedNamespaces {
-		if matched, _ := filepath.Match(pattern, ns.Name); matched {
+		if matched, _ := filepath.Match(pattern, namespaceName); matched {
 			return false
 		}
 	}
+	if len(r.AllowedNamespaces) > 0 {
+		matchedAny := false
+		for _, pattern := range r.AllowedNamespaces {
+			if matched, _ := filepath.Match(pattern, namespaceName); matched {
+				matchedAny = true
+				break
+			}
+		}
+		if !matchedAny {
+			return false
+		}
+	}
+	return true
+}
+
+// isNamespaceLabelsAllowed applies label-based whitelist and blacklist policies.
+func (r *LiqoTrapReconciler) isNamespaceLabelsAllowed(ns *corev1.Namespace) bool {
 	for k, v := range r.BlacklistLabels {
 		if val, exists := ns.Labels[k]; exists && (v == "" || val == v) {
 			return false

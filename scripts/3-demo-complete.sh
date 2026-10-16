@@ -69,6 +69,7 @@ sleep 2
 
 cleanup() {
   echo -e "\nDemo terminated. Cleaning up..."
+  kill "${PF_PID:-}" 2>/dev/null || true
   kubectl delete namespace demo-allowed demo-system demo-labeled --ignore-not-found=true >/dev/null 2>&1
   helm uninstall "$HELM_RELEASE" --namespace "$OPERATOR_NAMESPACE" >/dev/null 2>&1 || true
 }
@@ -114,6 +115,16 @@ for ns in demo-allowed demo-system demo-labeled; do
     echo -e "[\033[1;31mNO\033[0m]  $ns -> No Policy (Filtered or Dry-Run)"
   fi
 done
+
+echo -e "\n\033[1;36m=== Operator Prometheus Metrics ===\033[0m"
+# Port-forward to query the operator metrics endpoint in background
+kubectl port-forward -n "$OPERATOR_NAMESPACE" "deployment/${HELM_RELEASE}" 18080:8080 >/dev/null 2>&1 &
+PF_PID=$!
+sleep 2
+if curl -s --max-time 2 http://localhost:18080/metrics >/dev/null 2>&1; then
+  curl -s http://localhost:18080/metrics | grep -E '^liqo_' || true
+fi
+kill "$PF_PID" 2>/dev/null || true
 
 echo -e "\n---------------------------------------------------------------------"
 echo "Streaming Operator Logs (Press CTRL+C to exit and cleanup)..."

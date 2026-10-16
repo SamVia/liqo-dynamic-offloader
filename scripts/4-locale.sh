@@ -107,6 +107,11 @@ for ns in demo-allowed demo-system demo-labeled; do
   fi
 done
 
+if curl -s --max-time 1 http://localhost:8080/metrics >/dev/null 2>&1; then
+  echo -e "\n\033[1;33m>>> Prometheus Metrics after Phase 1 <<<\033[0m"
+  curl -s http://localhost:8080/metrics | grep -E '^liqo_' || true
+fi
+
 echo -e "\n4. PHASE 2: Testing Cleanup Deletion..."
 if [[ "$DRY_RUN" == "false" ]]; then
   echo "Deleting the stuck pod from 'demo-allowed' to trigger cleanup countdown..."
@@ -129,6 +134,12 @@ if [[ "$DRY_RUN" == "false" ]]; then
   fi
 else
   echo "Skipping Phase 2 because Dry-Run is enabled (no policy was actually created)."
+fi
+
+echo -e "\n5. PHASE 3: Prometheus Metrics Final Snapshot..."
+if curl -s --max-time 1 http://localhost:8080/metrics >/dev/null 2>&1; then
+  echo -e "\033[1;32m>>> Prometheus Metrics (:8080/metrics) <<<\033[0m"
+  curl -s http://localhost:8080/metrics | grep -E '^liqo_' || true
 fi
 
 echo -e "\n---------------------------------------------------------------------"

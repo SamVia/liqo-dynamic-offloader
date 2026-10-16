@@ -61,7 +61,8 @@ L'operatore viene configurato all'avvio tramite flag della riga di comando. Il c
 | Flag | Descrizione | Default |
 | --- | --- | --- |
 | `--target-cluster-ids` | Elenco separato da virgole degli ID Liqo. Se vuoto, la scelta viene delegata a Liqo. | *(vuoto)* |
-| `--excluded-namespaces` | Namespace da ignorare, separati da virgole. Supporta pattern glob come `*-system`. | `kube-system,liqo-system` |
+| `--allowed-namespaces` | Elenco separato da virgole di pattern glob da consentire (es. `tenant-*`). Se vuoto consente tutti. | *(vuoto)* |
+| `--excluded-namespaces` | Namespace da ignorare, separati da virgole. Supporta pattern glob come `kube-*,*-system`. | `kube-*,*-system` |
 | `--trap-whitelist-labels` | Label `key=value` richieste sul namespace per abilitare il Trap Controller. | *(vuoto)* |
 | `--trap-blacklist-labels` | Label `key=value` che disabilitano il Trap Controller sul namespace. | *(vuoto)* |
 | `--cleanup-whitelist-labels` | Label `key=value` richieste sul namespace per abilitare il Cleanup Controller. | *(vuoto)* |
@@ -70,6 +71,7 @@ L'operatore viene configurato all'avvio tramite flag della riga di comando. Il c
 | `--cleanup-delay` | Conto alla rovescia prima di eliminare una policy vuota. `0` disabilita la pulizia automatica. | `10s` |
 | `--enable-trap` | Abilita il controller LiqoTrap (auto-offloading dei pod bloccati). | `true` |
 | `--enable-cleanup` | Abilita il controller LiqoCleanup (rimozione automatica delle policy vuote). | `true` |
+| `--metrics-bind-address` | Indirizzo su cui esporre le metriche Prometheus. Usa `0` per disabilitare. | `:8080` |
 | `--dry-run` | Registra le azioni previste senza modificare lo stato del cluster. | `false` |
 
 ### High Availability
@@ -78,8 +80,9 @@ Il manager usa la **Leader Election** di `controller-runtime` con l'identificati
 
 ### Osservabilita
 
-Il Cleanup Controller pubblica metriche Prometheus nel registry di `controller-runtime`:
+I controller pubblicano metriche Prometheus nel registry di `controller-runtime`:
 
+- `liqo_trap_offloadings_created_total`: contatore delle policy di NamespaceOffloading create con successo dal Trap Controller;
 - `liqo_cleanup_namespaces_total`: contatore delle policy di offloading revocate con successo;
 - `liqo_cleanup_active_remote_pods{namespace="..."}`: gauge del numero di pod remoti attivi o in graceful shutdown per namespace.
 

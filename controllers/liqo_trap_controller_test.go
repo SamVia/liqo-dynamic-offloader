@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -155,6 +156,19 @@ func TestLiqoTrapReconciler_Reconcile(t *testing.T) {
 			expectPodPatched:    false,
 		},
 		{
+			// Fail-fast test: the namespace does not even exist in the client,
+			// proving r.Get is never called for excluded namespaces.
+			name:      "Glob Exclusion: Fail-fast bypasses API server Get",
+			namespace: "test-system",
+			podName:   "system-pod",
+			dryRun:    false,
+			existingObjects: []client.Object{
+				createStuckPod("system-pod", "test-system"),
+			},
+			expectPolicyCreated: false,
+			expectPodPatched:    false,
+		},
+		{
 			// Namespace blacklist labels provide an operator-controlled safety
 			// gate for workloads that must not be remediated.
 			name:      "Label Exclusion: Namespace has excluded label",
@@ -269,3 +283,92 @@ func TestLiqoTrapReconciler_Reconcile(t *testing.T) {
 		})
 	}
 }
+
+// TestLiqoTrapController_Metrics verifies that the Prometheus counter for
+// NamespaceOffloading creations increments when a missing policy is created.
+func TestLiqoTrapController_Metrics(t *testing.T) {
+	ctx := context.TODO()
+	s := scheme.Scheme
+	_ = corev1.AddToScheme(s)
+
+	initialCount := testutil.ToFloat64(liqoTrapOffloadingsCreatedTotal)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		createNamespace("metric-ns", nil),
+		createStuckPod("stuck-pod", "metric-ns"),
+	).Build()
+
+	reconciler := &LiqoTrapReconciler{
+		Client:          fakeClient,
+		BackoffDuration: 1 * time.Millisecond,
+		DryRun:          false,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "stuck-pod", Namespace: "metric-ns"}}
+	if _, err := reconciler.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	newCount := testutil.ToFloat64(liqoTrapOffloadingsCreatedTotal)
+	if newCount != initialCount+1 {
+		t.Errorf("Expected liqo_trap_offloadings_created_total to increase by 1, got %v (from %v)", newCount, initialCount)
+	}
+}
+
+// TestLiqoTrapReconciler_AllowedNamespaces verifies inclusion filtering using globbing.
+func TestLiqoTrapReconciler_AllowedNamespaces(t *testing.T) {
+	ctx := context.TODO()
+	s := scheme.Scheme
+	_ = corev1.AddToScheme(s)
+
+	tests := []struct {
+		name                string
+		namespace           string
+		allowedPatterns     []string
+		expectPolicyCreated bool
+	}{
+		{
+			name:                "Matches allowed pattern tenant-*",
+			namespace:           "tenant-app",
+			allowedPatterns:     []string{"tenant-*"},
+			expectPolicyCreated: true,
+		},
+		{
+			name:                "Fails to match allowed pattern tenant-* (fail-fast)",
+			namespace:           "other-app",
+			allowedPatterns:     []string{"tenant-*"},
+			expectPolicyCreated: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(
+				createNamespace(tt.namespace, nil),
+				createStuckPod("stuck-pod", tt.namespace),
+			).Build()
+
+			reconciler := &LiqoTrapReconciler{
+				Client:            fakeClient,
+				AllowedNamespaces: tt.allowedPatterns,
+				BackoffDuration:   time.Millisecond,
+			}
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "stuck-pod", Namespace: tt.namespace}}
+			if _, err := reconciler.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			checkCR := &unstructured.Unstructured{}
+			checkCR.SetGroupVersionKind(schema.GroupVersionKind{Group: "offloading.liqo.io", Version: "v1beta1", Kind: "NamespaceOffloading"})
+			err := fakeClient.Get(ctx, types.NamespacedName{Name: "offloading", Namespace: tt.namespace}, checkCR)
+
+			if tt.expectPolicyCreated && apierrors.IsNotFound(err) {
+				t.Errorf("Expected NamespaceOffloading to be created for %s", tt.namespace)
+			} else if !tt.expectPolicyCreated && err == nil {
+				t.Errorf("Expected NO NamespaceOffloading for %s", tt.namespace)
+			}
+		})
+	}
+}
+

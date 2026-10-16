@@ -11,12 +11,14 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 func main() {
 	var targetClusterIDs string
+	var allowedNamespaces string
 	var excludedNamespaces string
 	var trapWhitelist string
 	var trapBlacklist string
@@ -27,9 +29,11 @@ func main() {
 	var dryRun bool
 	var enableTrap bool
 	var enableCleanup bool
+	var metricsAddr string
 
 	flag.StringVar(&targetClusterIDs, "target-cluster-ids", "", "Comma-separated list of Target Cluster IDs. Empty delegates to Liqo.")
-	flag.StringVar(&excludedNamespaces, "excluded-namespaces", "kube-system,liqo-system", "Comma-separated list of namespaces to exclude (supports glob expressions like *-system).")
+	flag.StringVar(&allowedNamespaces, "allowed-namespaces", "", "Comma-separated list of namespace glob patterns to ALLOW (e.g. tenant-*). Empty allows all non-excluded namespaces.")
+	flag.StringVar(&excludedNamespaces, "excluded-namespaces", "kube-*,*-system", "Comma-separated list of namespaces to exclude (supports glob expressions like *-system).")
 
 	// Trap and Cleanup use independent labels so remediation and policy
 	// cleanup can be enabled for different namespace populations.
@@ -43,6 +47,7 @@ func main() {
 	flag.BoolVar(&dryRun, "dry-run", false, "Enable dry-run mode to log actions without modifying cluster state.")
 	flag.BoolVar(&enableTrap, "enable-trap", true, "Enable the LiqoTrap controller (auto-offloading of stuck pods).")
 	flag.BoolVar(&enableCleanup, "enable-cleanup", true, "Enable the LiqoCleanup controller (auto-removal of idle offloading policies).")
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to. Use '0' to disable.")
 
 	opts := zap.Options{
 		Development: true,
@@ -61,6 +66,9 @@ func main() {
 		LeaderElection:          true,
 		LeaderElectionID:        "liqo-auto-healing-lock",
 		LeaderElectionNamespace: "default",
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -68,6 +76,7 @@ func main() {
 	}
 
 	targetClusters := parseCSV(targetClusterIDs)
+	allowedNsList := parseCSV(allowedNamespaces)
 	excludedNsList := parseCSV(excludedNamespaces)
 
 	// Register the Trap reconciler only when enabled.
@@ -75,6 +84,7 @@ func main() {
 		if err = (&controllers.LiqoTrapReconciler{
 			Client:             mgr.GetClient(),
 			TargetClusters:     targetClusters,
+			AllowedNamespaces:  allowedNsList,
 			ExcludedNamespaces: excludedNsList,
 			WhitelistLabels:    parseLabels(trapWhitelist),
 			BlacklistLabels:    parseLabels(trapBlacklist),
@@ -93,6 +103,7 @@ func main() {
 		if err = (&controllers.LiqoCleanupReconciler{
 			Client:             mgr.GetClient(),
 			TargetClusters:     targetClusters,
+			AllowedNamespaces:  allowedNsList,
 			ExcludedNamespaces: excludedNsList,
 			WhitelistLabels:    parseLabels(cleanupWhitelist),
 			BlacklistLabels:    parseLabels(cleanupBlacklist),
@@ -114,6 +125,7 @@ func main() {
 		"EnableTrap", enableTrap,
 		"EnableCleanup", enableCleanup,
 		"TargetClusters", targetClusters,
+		"AllowedNamespaces", allowedNsList,
 		"ExcludedNamespaces", excludedNsList,
 		"TrapWhitelist", trapWhitelist,
 		"TrapBlacklist", trapBlacklist,
@@ -121,6 +133,7 @@ func main() {
 		"CleanupBlacklist", cleanupBlacklist,
 		"TrapBackoff", trapBackoff,
 		"CleanupDelay", cleanupDelay,
+		"MetricsAddr", metricsAddr,
 		"DryRun", dryRun)
 
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {

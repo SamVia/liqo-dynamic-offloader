@@ -32,8 +32,13 @@ spec:
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
         args:
         - "--target-cluster-ids={{ .Values.config.targetClusterIDs }}"
+        - "--allowed-namespaces={{ .Values.config.allowedNamespaces }}"
         - "--excluded-namespaces={{ .Values.config.excludedNamespaces }}"
         - "--trap-whitelist-labels={{ .Values.config.trapWhitelistLabels }}"
         - "--trap-blacklist-labels={{ .Values.config.trapBlacklistLabels }}"

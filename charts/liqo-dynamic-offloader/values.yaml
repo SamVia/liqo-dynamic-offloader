@@ -31,7 +31,8 @@ affinity: {}
 # Operator command-line configuration.
 config:
   targetClusterIDs: ""
-  excludedNamespaces: "kube-system,liqo-system,local-path-storage,crownlabs-system"
+  allowedNamespaces: ""
+  excludedNamespaces: "kube-*,*-system,local-path-storage,crownlabs-system"
   trapWhitelistLabels: ""
   trapBlacklistLabels: ""
   cleanupWhitelistLabels: ""
