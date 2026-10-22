@@ -18,6 +18,10 @@ IMAGE_PULL_POLICY="${IMAGE_PULL_POLICY:-Always}"
 HELM_RELEASE="${HELM_RELEASE:-liqo-dynamic-offloader}"
 OPERATOR_NAMESPACE="${OPERATOR_NAMESPACE:-default}"
 
+# Helm uses commas to separate --set entries, while these values are
+# intentionally comma-separated lists passed to the operator.
+HELM_TARGET_CLUSTERS="${TARGET_CLUSTERS//,/\\,}"
+
 kubectl config use-context kind-cluster-local >/dev/null 2>&1
 
 echo "1. Deploying the Operator with Helm..."
@@ -31,8 +35,8 @@ helm upgrade --install "$HELM_RELEASE" charts/liqo-dynamic-offloader \
   --set-string image.repository="$IMAGE_REPOSITORY" \
   --set-string image.tag="$IMAGE_TAG" \
   --set image.pullPolicy="$IMAGE_PULL_POLICY" \
-  --set-string config.targetClusterIDs="$TARGET_CLUSTERS" \
-  --set-string config.excludedNamespaces="*-system,local-path-storage" \
+  --set-string config.targetClusterIDs="$HELM_TARGET_CLUSTERS" \
+  --set-string 'config.excludedNamespaces=*-system\,local-path-storage' \
   --set-string config.trapBlacklistLabels="dynamic-offloader.liqo.io/ignore-trap=true" \
   --set config.trapBackoff="5s" \
   --set config.cleanupDelay="15s" \
