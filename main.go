@@ -157,16 +157,16 @@ func parseCSV(val string) []string {
 
 // parseLabels parses comma-separated key[=value] entries into a label policy
 // map. A key without a value is preserved as an empty value and is interpreted
-// by the controllers as a key-presence match.
+// by the controllers as a key-presence match. Keys and values are trimmed, and
+// entries with an empty key are ignored because they can never match a label.
 func parseLabels(val string) map[string]string {
 	res := make(map[string]string)
 	for _, s := range strings.Split(val, ",") {
-		parts := strings.SplitN(strings.TrimSpace(s), "=", 2)
-		if len(parts) == 2 {
-			res[parts[0]] = parts[1]
-		} else if len(parts) == 1 && parts[0] != "" {
-			res[parts[0]] = ""
+		key, value, _ := strings.Cut(s, "=")
+		if key = strings.TrimSpace(key); key == "" {
+			continue
 		}
+		res[key] = strings.TrimSpace(value)
 	}
 	return res
 }
