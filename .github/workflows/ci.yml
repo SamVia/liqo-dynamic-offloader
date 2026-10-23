@@ -87,6 +87,47 @@ jobs:
             bash -n "$script"
           done
 
+  e2e:
+    name: E2E Tests (kind + Liqo)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      KIND_VERSION: v0.31.0
+      LIQOCTL_VERSION: v1.2.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install kind and liqoctl
+        run: |
+          curl -fsSLo kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          sudo install kind /usr/local/bin/
+          curl -fsSLo liqoctl "https://github.com/liqotech/liqo/releases/download/${LIQOCTL_VERSION}/liqoctl-linux-amd64"
+          sudo install liqoctl /usr/local/bin/
+
+      # The suite creates the clusters, peers them with Liqo and deploys the
+      # operator built from this commit. Clusters are kept so the next step
+      # can inspect them; the runner is discarded at the end of the job.
+      - name: Run E2E tests
+        run: make e2e E2E_KEEP_CLUSTERS=true
+
+      - name: Dump cluster state on failure
+        if: failure()
+        run: |
+          kubectl --context kind-e2e-local get nodes -o wide || true
+          kubectl --context kind-e2e-local get pods -A -o wide || true
+          kubectl --context kind-e2e-local get namespaceoffloadings -A || true
+          kubectl --context kind-e2e-local logs -n dynamic-offloader-system deployment/liqo-dynamic-offloader --tail=200 || true
+
   docker-build:
     name: Validate Container Build
     needs: build-and-test
