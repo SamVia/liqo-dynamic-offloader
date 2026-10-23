@@ -62,3 +62,17 @@ helm-template: ## Run helm template to render the manifests locally
 .PHONY: helm-install
 helm-install: helm-lint ## Install or upgrade the Helm release
 	helm upgrade --install $(HELM_RELEASE) $(CHART) --namespace $(HELM_NAMESPACE) --create-namespace
+
+# E2E tests (Ginkgo). The suite creates two kind clusters, peers them with Liqo,
+# deploys the operator built from the working tree and deletes the clusters at
+# the end. See test/e2e/e2e_suite_test.go for the environment variables, e.g.
+#   make e2e E2E_KEEP_CLUSTERS=true          keep the clusters for inspection
+#   make e2e E2E_SKIP_CLUSTER_SETUP=true     rerun the specs on kept clusters
+.PHONY: e2e
+e2e: ## Run the E2E tests on fresh kind clusters
+	go test -tags e2e -v -count=1 -timeout 40m ./test/e2e/... -ginkgo.v
+
+.PHONY: e2e-clean
+e2e-clean: ## Delete the kind clusters kept by the E2E suite
+	kind delete cluster --name $${E2E_LOCAL_CLUSTER:-e2e-local}
+	kind delete cluster --name $${E2E_REMOTE_CLUSTER:-e2e-remote}
