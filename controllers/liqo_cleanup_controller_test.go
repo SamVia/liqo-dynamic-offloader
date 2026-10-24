@@ -189,3 +189,44 @@ func TestLiqoCleanupReconciler_Reconcile(t *testing.T) {
 		})
 	}
 }
+func TestLiqoCleanupReconciler_EdgeCases(t *testing.T) {
+	ctx := context.TODO()
+	s := scheme.Scheme
+	_ = corev1.AddToScheme(s)
+
+	namespace := "default"
+	ns := createCleanupNamespace(namespace)
+	offloadCR := createCleanupOffloadingCR(namespace, "")
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(ns, offloadCR).Build()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
+
+	// Cover Zero Delay Path
+	reconcilerZero := &LiqoCleanupReconciler{
+		Client:       fakeClient,
+		CleanupDelay: 0,
+		DryRun:       false,
+	}
+	if _, err := reconcilerZero.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	checkCR := &unstructured.Unstructured{}
+	checkCR.SetGroupVersionKind(schema.GroupVersionKind{Group: "offloading.liqo.io", Version: "v1beta1", Kind: "NamespaceOffloading"})
+	_ = fakeClient.Get(ctx, types.NamespacedName{Name: "offloading", Namespace: namespace}, checkCR)
+	if checkCR.GetAnnotations()[emptySinceAnnotation] != "" {
+		t.Errorf("Expected annotation NOT to be set because CleanupDelay is 0")
+	}
+
+	// Cover Dry Run Path
+	reconcilerDryRun := &LiqoCleanupReconciler{
+		Client:       fakeClient,
+		CleanupDelay: 10 * time.Minute,
+		DryRun:       true,
+	}
+	if _, err := reconcilerDryRun.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	_ = fakeClient.Get(ctx, types.NamespacedName{Name: "offloading", Namespace: namespace}, checkCR)
+	if checkCR.GetAnnotations()[emptySinceAnnotation] != "" {
+		t.Errorf("Expected annotation NOT to be set because DryRun is true")
+	}
+}

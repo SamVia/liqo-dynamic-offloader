@@ -371,3 +371,48 @@ func TestLiqoTrapReconciler_AllowedNamespaces(t *testing.T) {
 		})
 	}
 }
+func TestLiqoTrapReconciler_InitContainerAndDryRun(t *testing.T) {
+	ctx := context.TODO()
+	s := scheme.Scheme
+	_ = corev1.AddToScheme(s)
+
+	namespace := "default"
+	podName := "init-trapped-pod"
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
+
+	// Create a Pod that is stuck in the InitContainer phase
+	trappedPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: namespace},
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{Reason: "OffloadingBackOff"},
+					},
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(ns, trappedPod).Build()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: podName, Namespace: namespace}}
+
+	// Reconcile with DryRun enabled
+	reconciler := &LiqoTrapReconciler{
+		Client:          fakeClient,
+		BackoffDuration: 2 * time.Second,
+		DryRun:          true, // Coverage for DryRun logging
+	}
+
+	if _, err := reconciler.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Because it was a DryRun, the pod should NOT have the force-sync annotation applied
+	var checkPod corev1.Pod
+	_ = fakeClient.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, &checkPod)
+	if checkPod.GetAnnotations()["dynamic-offloader.liqo.io/force-sync"] != "" {
+		t.Errorf("Expected force-sync annotation NOT to be set because DryRun is true")
+	}
+}
