@@ -123,12 +123,12 @@ if [[ "$DRY_RUN" == "false" ]]; then
   echo "Deleting the deployment from 'demo-allowed' to trigger cleanup countdown..."
   kubectl delete deployment trap-deployment -n demo-allowed >/dev/null 2>&1
   
-  echo "Waiting 20 seconds for the 15s timer to expire..."
+  echo "Waiting 30 seconds for the 15s timer to expire..."
   for i in {1..10}; do
     if ! kubectl get namespaceoffloading offloading -n demo-allowed >/dev/null 2>&1; then
       break
     fi
-    sleep 2
+    sleep 3
   done
   
   echo -e "\n\033[1;36m=== Phase 2 Results (Cleanup Deletion) ===\033[0m"
