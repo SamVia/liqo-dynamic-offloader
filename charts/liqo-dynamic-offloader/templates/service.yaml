@@ -1,0 +1,17 @@
+{{- if .Values.metrics.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "liqo-dynamic-offloader.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "liqo-dynamic-offloader.labels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "liqo-dynamic-offloader.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: https
+      port: 8443
+      targetPort: https
+      protocol: TCP
+{{- end }}
