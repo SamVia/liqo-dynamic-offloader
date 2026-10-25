@@ -74,10 +74,11 @@ The operator is configured at startup through command-line flags. The Helm chart
 | `--enable-cleanup` | Enables the LiqoCleanup controller (auto-removal of empty offloading policies). | `true` |
 | `--metrics-bind-address` | The address the Prometheus metrics endpoint binds to. Use `0` to disable. | `:8080` |
 | `--dry-run` | Logs intended actions without modifying cluster state. | `false` |
+| `--leader-election-namespace` | Namespace where the operator's Leader Election Lease will be created. Set explicitly in deployments; the Helm chart uses the release namespace. | `default` |
 
 ### High Availability
 
-The manager uses `controller-runtime` **Leader Election** with the ID `liqo-auto-healing-lock` and saves the lock in the `default` namespace (via `Lease` resources). You can run multiple replicas of the operator: only one replica becomes the leader and performs reconciliation, while the others remain on standby ready to take over in case of failure.
+The manager uses `controller-runtime` **Leader Election** with the ID `liqo-auto-healing-lock`. The lock is saved as a `Lease` resource in the namespace specified by the `--leader-election-namespace` flag (passed dynamically via Helm). You can run multiple replicas of the operator: only one replica becomes the leader and performs reconciliation, while the others remain on standby ready to take over in case of failure.
 
 ### Observability
 
@@ -191,6 +192,17 @@ offloading policies:
 Unlike `3-demo-complete.sh`, this script does not install a Helm release or
 pull a container image. It is intended for fast local development feedback;
 use the Helm demo to validate the packaged, in-cluster deployment.
+
+## Local Operator Validation
+
+For development and controller behavior validation without building or deploying a container, the repository provides several scripts in the `scripts/` directory. These scripts compile the operator locally (`go build` or `go run`) and feature robust cleanup mechanisms to avoid orphaned processes.
+
+*   **`scripts/4-locale.sh`**: Validates the core namespace filtering and cleanup behavior.
+*   **`scripts/5-test-resilience.sh`**: Tests the operator's ability to recover missed events after a crash or downtime.
+*   **`scripts/6-test-edge-case.sh`**: Verifies the operator does not panic when a trapped pod is deleted mid-reconciliation.
+*   **`scripts/7-test-concurrency.sh`**: Evaluates the operator's performance when simultaneously handling offloading events for multiple namespaces and multiple target clusters (`cluster-alpha` and `cluster-beta`).
+
+These scripts automatically ensure the necessary infrastructure is present by invoking `1-setup.sh` as needed.
 
 ## Helm Deployment
 

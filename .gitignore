@@ -7,7 +7,7 @@
 *.dylib
 *.test
 *.out
-
+*.txt
 # Go workspace and vendor directories
 /vendor/
 go.work
@@ -16,6 +16,7 @@ go.work.sum
 # Test coverage profiles
 coverage.out
 c.out
+coverage_*
 
 # IDEs and Text Editors
 .vscode/
@@ -33,3 +34,5 @@ Thumbs.db
 liqo_metrics_dump
 
 private
+temp.*
+TODO*
