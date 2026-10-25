@@ -1,42 +1,38 @@
+version: "2"
+
 run:
   timeout: 5m
   tests: true
 
 linters:
-  # Disable all linters by default and enable only the ones listed explicitly.
-  # This prevents new linters added in future golangci-lint releases from
-  # breaking the pipeline without warning.
-  disable-all: true
+  default: none
   enable:
-    # Correctness
-    - errcheck      # Reports unhandled errors (forgotten err != nil checks).
-    - govet         # Same checks as go vet: detects suspicious Go constructs.
-    - staticcheck   # Advanced static analysis: unreachable code, deprecations, logic bugs.
-    - unused        # Reports exported functions, types and variables that are never used.
-    # Style and readability
-    - gofmt         # Checks that code is formatted with go fmt.
-    - goimports     # Checks that imports are sorted and grouped correctly.
-    - misspell      # Finds spelling mistakes in comments and strings.
-    # Simplicity
-    - unconvert     # Reports redundant type conversions (e.g. int(x) when x is already int).
-    - unparam       # Reports function parameters always called with the same value.
+    - errcheck
+    - govet
+    - staticcheck
+    - unused
+    - misspell
+    - unconvert
+    - unparam
+  settings:
+    errcheck:
+      check-blank: false
+      exclude-functions:
+        - "fmt:.*"
+        - "io:Close"
+    misspell:
+      locale: US
+  exclusions:
+    rules:
+      - path: '_test[.]go'
+        linters:
+          - unparam
+          - unused
 
-linters-settings:
-  errcheck:
-    check-blank: false
-    exclude-functions:
-      - "fmt:.*"
-      - "io:Close"
-  gofmt:
-    simplify: true
-  misspell:
-    locale: US
-
-issues:
-  max-same-issues: 0
-  exclude-rules:
-    # Test files may declare helper variables that are not always read by every test case.
-    - path: '_test[.]go'
-      linters:
-        - unparam
-        - unused
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
