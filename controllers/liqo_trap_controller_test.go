@@ -250,7 +250,12 @@ func TestLiqoTrapReconciler_Reconcile(t *testing.T) {
 			}
 
 			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: tt.podName, Namespace: tt.namespace}}
-			_, err := reconciler.Reconcile(ctx, req)
+			result, err := reconciler.Reconcile(ctx, req)
+			if err == nil && result.RequeueAfter > 0 {
+				// A newly created policy is handled on the next reconciliation,
+				// after the controller yields instead of blocking its worker.
+				_, err = reconciler.Reconcile(ctx, req)
+			}
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
