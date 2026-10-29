@@ -24,6 +24,7 @@ func main() {
 	var cleanupWhitelist string
 	var cleanupBlacklist string
 	var trapBackoff time.Duration
+	var trapMaxForceSync int
 	var cleanupDelay time.Duration
 	var dryRun bool
 	var enableTrap bool
@@ -43,6 +44,7 @@ func main() {
 	flag.StringVar(&cleanupBlacklist, "cleanup-blacklist-labels", "", "Comma-separated key=value labels on namespace to PREVENT Cleanup.")
 
 	flag.DurationVar(&trapBackoff, "trap-backoff", 2*time.Second, "Wait duration before verifying stuck pod.")
+	flag.IntVar(&trapMaxForceSync, "trap-max-force-sync", 5, "Maximum force-sync attempts per trapped pod before giving up. 0 means unlimited.")
 	flag.DurationVar(&cleanupDelay, "cleanup-delay", 10*time.Second, "Delay before cleaning up an empty offloading policy. Set to 0 to disable.")
 	flag.BoolVar(&dryRun, "dry-run", false, "Enable dry-run mode to log actions without modifying cluster state.")
 	flag.BoolVar(&enableTrap, "enable-trap", true, "Enable the LiqoTrap controller (auto-offloading of stuck pods).")
@@ -93,14 +95,16 @@ func main() {
 	// Register the Trap reconciler only when enabled.
 	if enableTrap {
 		if err = (&controllers.LiqoTrapReconciler{
-			Client:             mgr.GetClient(),
-			TargetClusters:     targetClusters,
-			AllowedNamespaces:  allowedNsList,
-			ExcludedNamespaces: excludedNsList,
-			WhitelistLabels:    parseLabels(trapWhitelist),
-			BlacklistLabels:    parseLabels(trapBlacklist),
-			BackoffDuration:    trapBackoff,
-			DryRun:             dryRun,
+			Client:               mgr.GetClient(),
+			TargetClusters:       targetClusters,
+			AllowedNamespaces:    allowedNsList,
+			ExcludedNamespaces:   excludedNsList,
+			WhitelistLabels:      parseLabels(trapWhitelist),
+			BlacklistLabels:      parseLabels(trapBlacklist),
+			BackoffDuration:      trapBackoff,
+			MaxForceSyncAttempts: trapMaxForceSync,
+			Recorder:             mgr.GetEventRecorderFor("liqo-trap"),
+			DryRun:               dryRun,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create controller", "controller", "LiqoTrap")
 			os.Exit(1)
@@ -143,6 +147,7 @@ func main() {
 		"CleanupWhitelist", cleanupWhitelist,
 		"CleanupBlacklist", cleanupBlacklist,
 		"TrapBackoff", trapBackoff,
+		"TrapMaxForceSync", trapMaxForceSync,
 		"CleanupDelay", cleanupDelay,
 		"MetricsAddr", metricsAddr,
 		"DryRun", dryRun)

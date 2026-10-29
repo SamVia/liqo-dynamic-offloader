@@ -83,6 +83,7 @@ spec:
         - "--cleanup-whitelist-labels={{ .Values.config.cleanupWhitelistLabels }}"
         - "--cleanup-blacklist-labels={{ .Values.config.cleanupBlacklistLabels }}"
         - "--trap-backoff={{ .Values.config.trapBackoff }}"
+        - "--trap-max-force-sync={{ .Values.config.trapMaxForceSync }}"
         - "--cleanup-delay={{ .Values.config.cleanupDelay }}"
         - "--enable-trap={{ .Values.config.enableTrap }}"
         - "--enable-cleanup={{ .Values.config.enableCleanup }}"

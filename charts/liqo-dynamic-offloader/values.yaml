@@ -38,6 +38,8 @@ config:
   cleanupWhitelistLabels: ""
   cleanupBlacklistLabels: ""
   trapBackoff: "2s"
+  # Force-sync attempts per trapped pod before giving up (0 = unlimited).
+  trapMaxForceSync: 5
   cleanupDelay: "10s"
   enableTrap: true
   enableCleanup: true

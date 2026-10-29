@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -423,5 +425,142 @@ func TestLiqoTrapReconciler_InitContainerAndDryRun(t *testing.T) {
 	_ = fakeClient.Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, &checkPod)
 	if checkPod.GetAnnotations()["dynamic-offloader.liqo.io/force-sync"] != "" {
 		t.Errorf("Expected force-sync annotation NOT to be set because DryRun is true")
+	}
+}
+
+// TestLiqoTrapReconciler_ForceSyncLimits verifies that force-sync attempts on
+// a pod are spaced out, counted and bounded, and that a policy being deleted
+// is waited for instead of being used.
+func TestLiqoTrapReconciler_ForceSyncLimits(t *testing.T) {
+	ctx := context.TODO()
+	s := scheme.Scheme
+	_ = corev1.AddToScheme(s)
+
+	const backoff = time.Second
+	stuckPodWith := func(attempts string, lastSync time.Time) *corev1.Pod {
+		pod := createStuckPod("stuck-pod", "default")
+		pod.Annotations = map[string]string{
+			forceSyncAttemptsAnnotation: attempts,
+			forceSyncAnnotation:         lastSync.UTC().Format(time.RFC3339Nano),
+		}
+		return pod
+	}
+	deletingPolicy := func() *unstructured.Unstructured {
+		policy := createTrapOffloadingCR("default")
+		now := metav1.Now()
+		policy.SetDeletionTimestamp(&now)
+		policy.SetFinalizers([]string{"liqo.io/test-finalizer"})
+		return policy
+	}
+
+	tests := []struct {
+		name            string
+		pod             *corev1.Pod
+		policy          *unstructured.Unstructured
+		expectAttempts  string
+		expectRequeue   time.Duration
+		expectEventPart string
+	}{
+		{
+			// The first patch counts the attempt and schedules the next check.
+			name:           "First attempt: patches the pod and counts it",
+			pod:            createStuckPod("stuck-pod", "default"),
+			policy:         createTrapOffloadingCR("default"),
+			expectAttempts: "1",
+			expectRequeue:  backoff,
+		},
+		{
+			// After two attempts the next one waits twice the base backoff.
+			name:           "Backoff active: waits before the next attempt",
+			pod:            stuckPodWith("2", time.Now()),
+			policy:         createTrapOffloadingCR("default"),
+			expectAttempts: "2",
+			expectRequeue:  2 * backoff,
+		},
+		{
+			// Once the backoff has elapsed the pod is patched again.
+			name:           "Backoff elapsed: patches again and doubles the wait",
+			pod:            stuckPodWith("1", time.Now().Add(-time.Hour)),
+			policy:         createTrapOffloadingCR("default"),
+			expectAttempts: "2",
+			expectRequeue:  2 * backoff,
+		},
+		{
+			// At the limit the pod is left alone and a Warning event explains why.
+			name:            "Limit reached: gives up and records a warning event",
+			pod:             stuckPodWith("3", time.Now().Add(-time.Hour)),
+			policy:          createTrapOffloadingCR("default"),
+			expectAttempts:  "3",
+			expectRequeue:   0,
+			expectEventPart: "Warning ForceSyncLimitReached",
+		},
+		{
+			// A policy being deleted must not be used to sync the pod.
+			name:           "Policy being deleted: waits instead of syncing",
+			pod:            createStuckPod("stuck-pod", "default"),
+			policy:         deletingPolicy(),
+			expectAttempts: "",
+			expectRequeue:  backoff,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(s).
+				WithObjects(createNamespace("default", nil), tt.pod, tt.policy).Build()
+			recorder := record.NewFakeRecorder(10)
+			reconciler := &LiqoTrapReconciler{
+				Client:               fakeClient,
+				BackoffDuration:      backoff,
+				MaxForceSyncAttempts: 3,
+				Recorder:             recorder,
+			}
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "stuck-pod", Namespace: "default"}}
+			result, err := reconciler.Reconcile(ctx, req)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			// Requeues measured from "now" can be a few milliseconds shorter.
+			if result.RequeueAfter > tt.expectRequeue || result.RequeueAfter < tt.expectRequeue-100*time.Millisecond {
+				t.Errorf("RequeueAfter = %v; want about %v", result.RequeueAfter, tt.expectRequeue)
+			}
+
+			var pod corev1.Pod
+			_ = fakeClient.Get(ctx, req.NamespacedName, &pod)
+			if got := pod.GetAnnotations()[forceSyncAttemptsAnnotation]; got != tt.expectAttempts {
+				t.Errorf("force-sync attempts = %q; want %q", got, tt.expectAttempts)
+			}
+
+			select {
+			case event := <-recorder.Events:
+				if tt.expectEventPart == "" || !strings.Contains(event, tt.expectEventPart) {
+					t.Errorf("Unexpected event %q; want %q", event, tt.expectEventPart)
+				}
+			default:
+				if tt.expectEventPart != "" {
+					t.Errorf("Expected event %q, got none", tt.expectEventPart)
+				}
+			}
+		})
+	}
+}
+
+// TestForceSyncDelay verifies the exponential spacing and its cap.
+func TestForceSyncDelay(t *testing.T) {
+	tests := []struct {
+		attempts int
+		want     time.Duration
+	}{
+		{1, time.Second},
+		{2, 2 * time.Second},
+		{3, 4 * time.Second},
+		{30, maxForceSyncDelay},
+	}
+	for _, tt := range tests {
+		if got := forceSyncDelay(time.Second, tt.attempts); got != tt.want {
+			t.Errorf("forceSyncDelay(1s, %d) = %v; want %v", tt.attempts, got, tt.want)
+		}
 	}
 }

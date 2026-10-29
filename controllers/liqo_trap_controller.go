@@ -2,7 +2,9 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -43,17 +46,26 @@ type LiqoTrapReconciler struct {
 	WhitelistLabels    map[string]string
 	BlacklistLabels    map[string]string
 	BackoffDuration    time.Duration
-	DryRun             bool
+	// MaxForceSyncAttempts bounds the force-sync patches applied to one pod;
+	// 0 means unlimited.
+	MaxForceSyncAttempts int
+	Recorder             record.EventRecorder
+	DryRun               bool
 }
 
 // Annotations used to coordinate remediation attempts with Liqo's asynchronous
 // offloading behavior.
 const lastRemediationAnnotation = "dynamic-offloader.liqo.io/last-remediation"
 const forceSyncAnnotation = "dynamic-offloader.liqo.io/force-sync"
+const forceSyncAttemptsAnnotation = "dynamic-offloader.liqo.io/force-sync-attempts"
+
+// maxForceSyncDelay caps the exponential spacing between force-sync attempts.
+const maxForceSyncDelay = 5 * time.Minute
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;create;patch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile handles pods trapped in Liqo's OffloadingBackOff state. It first
 // ensures that the namespace has an offloading policy, then waits for Liqo's
@@ -171,6 +183,14 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
+	if offloadCR.GetDeletionTimestamp() != nil {
+		// The policy is being removed, usually by the Cleanup controller after
+		// the namespace went idle. Syncing the pod against it would fail once
+		// the deletion completes, so wait and recreate the policy afterwards.
+		logger.Info("NamespaceOffloading is being deleted. Waiting to recreate it.", "namespace", namespaceName)
+		return ctrl.Result{RequeueAfter: r.BackoffDuration}, nil
+	}
+
 	// Re-read the pod because Liqo may have recovered it during the backoff.
 	// Avoid annotating a pod that is no longer trapped.
 	var latestPod corev1.Pod
@@ -181,6 +201,22 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 
 		if !r.DryRun {
+			attempts := forceSyncAttempts(&latestPod)
+			if r.MaxForceSyncAttempts > 0 && attempts >= r.MaxForceSyncAttempts {
+				// Stop retrying a pod that never recovers, for example because the
+				// policy excludes its cluster or the remote cluster is down.
+				logger.Info("Force-sync limit reached. Giving up on the pod.", "pod", podName, "attempts", attempts)
+				r.recordEvent(&latestPod, corev1.EventTypeWarning, "ForceSyncLimitReached",
+					fmt.Sprintf("Still in OffloadingBackOff after %d force-sync attempts. Check the NamespaceOffloading policy and the remote cluster, then delete the pod to retry.", attempts))
+				return ctrl.Result{}, nil
+			}
+			if attempts > 0 {
+				// Space retries out exponentially, measured from the last sync.
+				if remaining := forceSyncDelay(r.BackoffDuration, attempts) - time.Since(lastForceSync(&latestPod)); remaining > 0 {
+					return ctrl.Result{RequeueAfter: remaining}, nil
+				}
+			}
+
 			originalPod := latestPod.DeepCopy()
 
 			annotations := latestPod.GetAnnotations()
@@ -190,6 +226,7 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			// The timestamp changes the pod object and asks downstream Liqo
 			// components to process a new synchronization attempt.
 			annotations[forceSyncAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
+			annotations[forceSyncAttemptsAnnotation] = strconv.Itoa(attempts + 1)
 			latestPod.SetAnnotations(annotations)
 
 			if err := r.Patch(ctx, &latestPod, client.MergeFrom(originalPod)); err != nil {
@@ -201,7 +238,11 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				logger.Error(err, "Failed to persist namespace remediation backoff", "namespace", namespaceName)
 				return ctrl.Result{}, err
 			}
-			logger.Info("Successfully patched the stuck pod to trigger kubelet sync.", "pod", podName)
+			logger.Info("Successfully patched the stuck pod to trigger kubelet sync.", "pod", podName, "attempt", attempts+1)
+
+			// Check again later even without new events, so a pod that stays
+			// trapped gets its next attempt or reaches the limit.
+			return ctrl.Result{RequeueAfter: forceSyncDelay(r.BackoffDuration, attempts+1)}, nil
 		} else {
 			// Dry-run evaluates the same recovery path but does not create,
 			// update, or annotate any cluster resource.
@@ -275,6 +316,42 @@ func (r *LiqoTrapReconciler) persistRemediationBackoff(ctx context.Context, name
 	ns.SetAnnotations(annotations)
 
 	return r.Patch(ctx, &ns, client.MergeFrom(originalNS))
+}
+
+// forceSyncAttempts returns how many force-sync patches the pod has received.
+func forceSyncAttempts(pod *corev1.Pod) int {
+	n, err := strconv.Atoi(pod.GetAnnotations()[forceSyncAttemptsAnnotation])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// lastForceSync returns when the pod was last force-synced, or the zero time
+// when the annotation is missing or malformed.
+func lastForceSync(pod *corev1.Pod) time.Time {
+	t, _ := time.Parse(time.RFC3339Nano, pod.GetAnnotations()[forceSyncAnnotation])
+	return t
+}
+
+// forceSyncDelay is the wait after the given number of attempts: the base
+// backoff, doubled after each attempt and capped at maxForceSyncDelay.
+func forceSyncDelay(base time.Duration, attempts int) time.Duration {
+	delay := base
+	for i := 1; i < attempts && delay < maxForceSyncDelay; i++ {
+		delay *= 2
+	}
+	if delay > maxForceSyncDelay {
+		return maxForceSyncDelay
+	}
+	return delay
+}
+
+// recordEvent emits a Kubernetes event when a recorder is configured.
+func (r *LiqoTrapReconciler) recordEvent(obj runtime.Object, eventType, reason, message string) {
+	if r.Recorder != nil {
+		r.Recorder.Event(obj, eventType, reason, message)
+	}
 }
 
 // isPodTrapped checks the pod reason and both application and init-container

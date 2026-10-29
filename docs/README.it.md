@@ -36,7 +36,9 @@ Quando rileva il trap, ignora i namespace esclusi e i pod già in terminazione. 
 - usa `podOffloadingStrategy: LocalAndRemote`;
 - vincola l'offloading tramite l'etichetta `liqo.io/remote-cluster-id` se i cluster sono specificati con `--target-cluster-ids`, altrimenti delega la scelta a Liqo;
 - attende il periodo `--trap-backoff`, lasciando il tempo alla logica asincrona di ammissione e schedulazione di Liqo di elaborare la nuova policy;
-- rilegge il pod dopo l'attesa e applica l'annotazione `force-sync` solo se è ancora in `OffloadingBackOff`.
+- rilegge il pod dopo l'attesa e applica l'annotazione `force-sync` solo se è ancora in `OffloadingBackOff`;
+- distanzia i tentativi di `force-sync` sullo stesso pod in modo esponenziale (il periodo `--trap-backoff`, raddoppiato a ogni tentativo, fino a 5 minuti) e si ferma dopo `--trap-max-force-sync` tentativi, lasciando sul pod un evento di warning `ForceSyncLimitReached`;
+- se la policy è in cancellazione, attende che venga eliminata e poi la ricrea.
 
 Se la policy esiste già, il controller rispetta il cooldown della remediation a livello di namespace prima di procedere. Se Liqo ha già recuperato il pod durante il backoff, non viene eseguita alcuna modifica. In modalità dry-run vengono registrate le azioni previste senza creare o aggiornare risorse.
 
@@ -68,6 +70,7 @@ L'operatore viene configurato all'avvio tramite flag della riga di comando. Il c
 | `--cleanup-whitelist-labels` | Label `key=value` richieste sul namespace per abilitare il Cleanup Controller. | *(vuoto)* |
 | `--cleanup-blacklist-labels` | Label `key=value` che disabilitano il Cleanup Controller sul namespace. | *(vuoto)* |
 | `--trap-backoff` | Durata dell'attesa prima di ricontrollare un pod bloccato. | `2s` |
+| `--trap-max-force-sync` | Tentativi di `force-sync` per pod bloccato prima di rinunciare. `0` significa illimitati. | `5` |
 | `--cleanup-delay` | Conto alla rovescia prima di eliminare una policy vuota. `0` disabilita la pulizia automatica. | `10s` |
 | `--enable-trap` | Abilita il controller LiqoTrap (auto-offloading dei pod bloccati). | `true` |
 | `--enable-cleanup` | Abilita il controller LiqoCleanup (rimozione automatica delle policy vuote). | `true` |
