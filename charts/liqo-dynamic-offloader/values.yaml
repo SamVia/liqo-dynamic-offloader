@@ -55,6 +55,21 @@ serviceAccount:
   create: true
   name: liqo-dynamic-offloader
 
+metrics:
+  enabled: false
+  proxy:
+    image:
+      repository: gcr.io/kubebuilder/kube-rbac-proxy
+      tag: v0.16.0
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 64Mi
+
 # Reserved for future webhook support. Webhooks are not implemented and must
 # remain disabled until the Service, manager endpoint, and certificate flow
 # are delivered together.

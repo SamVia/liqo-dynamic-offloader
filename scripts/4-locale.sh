@@ -2,9 +2,9 @@
 set -e
 
 echo -e "\033[1;36m=== Local Operator Demo (Dynamic Polling) ===\033[0m"
-
+bash ./scripts/1-setup.sh 1
 DRY_RUN="false"
-if [[ "$1" == "--dry-run" ]]; then
+if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN="true"
   echo -e "\033[1;33m>>> DRY-RUN MODE ENABLED <<<\033[0m"
 fi
@@ -15,9 +15,9 @@ DEMO_REMOTE_CLUSTER="${DEMO_REMOTE_CLUSTER:-cluster-remote}"
 kubectl config use-context kind-cluster-local >/dev/null 2>&1
 
 echo -e "\n1. Preparing Test Namespaces..."
-kubectl create namespace demo-allowed --dry-run=client -o yaml | kubectl apply -f -
-kubectl create namespace demo-system --dry-run=client -o yaml | kubectl apply -f -
-cat <<EOF | kubectl apply -f -
+kubectl create namespace demo-allowed --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+kubectl create namespace demo-system --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+cat <<EOF | kubectl apply -f - >/dev/null
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -26,14 +26,16 @@ metadata:
     dynamic-offloader.liqo.io/ignore-trap: "true"
 EOF
 
-# Pulizia preventiva
+# Perform preliminary cleanup.
 for ns in demo-allowed demo-system demo-labeled; do
   kubectl delete deployment trap-deployment -n $ns --ignore-not-found=true >/dev/null 2>&1
   kubectl delete namespaceoffloading offloading -n $ns --ignore-not-found=true >/dev/null 2>&1
 done
 
 echo -e "\n2. Starting the Operator locally (via go run)..."
+# Pass the new --leader-election-namespace flag.
 go run ./main.go \
+  --leader-election-namespace="default" \
   --target-cluster-ids="${TARGET_CLUSTERS}" \
   --excluded-namespaces="*-system,local-path-storage" \
   --trap-blacklist-labels="dynamic-offloader.liqo.io/ignore-trap=true" \
@@ -50,15 +52,20 @@ while ! grep -q "successfully acquired lease\|Starting workers" /tmp/liqo-operat
   sleep 1
   timeout=$((timeout-1))
   if [ $timeout -le 0 ]; then
-    echo "Timeout waiting for operator to start."
+    echo -e "\033[1;31mTimeout waiting for operator to start. Check logs:\033[0m"
+    cat /tmp/liqo-operator-local.log
     exit 1
   fi
 done
 echo -e "\033[1;32mOperator is ready!\033[0m"
 
+echo -e "\n\033[1;33m>>> Starting Pod Watcher in 'demo-allowed' <<<\033[0m"
+kubectl get pods -n demo-allowed -w &
+WATCH_PID=$!
+
 echo -e "\n3. PHASE 1: Springing the traps across all namespaces..."
 for ns in demo-allowed demo-system demo-labeled; do
-cat <<EOF | kubectl apply -f -
+cat <<EOF | kubectl apply -f - >/dev/null
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -86,7 +93,6 @@ EOF
 done
 
 echo -e "\nWaiting for Liqo to reject the pod and the Operator to react (up to 30s)..."
-# Polling dinamico: invece di aspettare ciecamente, controlla ogni 2 secondi
 if [[ "$DRY_RUN" == "false" ]]; then
   for i in {1..15}; do
     if kubectl get namespaceoffloading offloading -n demo-allowed >/dev/null 2>&1; then
@@ -95,7 +101,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
     sleep 2
   done
 else
-  sleep 15 # Nel dry-run aspettiamo un po' per far stampare i log
+  sleep 15
 fi
 
 echo -e "\n\033[1;36m=== Phase 1 Results (Trap Creation) ===\033[0m"
@@ -117,9 +123,10 @@ if [[ "$DRY_RUN" == "false" ]]; then
   echo "Deleting the stuck pod from 'demo-allowed' to trigger cleanup countdown..."
   kubectl delete deployment trap-deployment -n demo-allowed >/dev/null 2>&1
   
-  echo "Waiting for the 15s timer to expire and policy to be deleted (up to 25s)..."
-  # Polling dinamico per la deletion
-  for i in {1..13}; do
+  # The countdown starts only once the remote pod has fully terminated, and
+  # Liqo's finalizer keeps the policy briefly after deletion.
+  echo "Waiting for the pod to terminate, the 15s timer to expire and the policy to be deleted (up to 60s)..."
+  for i in {1..30}; do
     if ! kubectl get namespaceoffloading offloading -n demo-allowed >/dev/null 2>&1; then
       break
     fi
@@ -135,6 +142,9 @@ if [[ "$DRY_RUN" == "false" ]]; then
 else
   echo "Skipping Phase 2 because Dry-Run is enabled (no policy was actually created)."
 fi
+
+# Stop watching pods
+kill "${WATCH_PID:-}" 2>/dev/null || true
 
 echo -e "\n5. PHASE 3: Prometheus Metrics Final Snapshot..."
 if curl -s --max-time 1 http://localhost:8080/metrics >/dev/null 2>&1; then

@@ -3,11 +3,9 @@
 package e2e
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"math/rand"
-	"strconv"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -182,34 +180,6 @@ func operatorLogs() (string, error) {
 	}
 	raw, err := clientset.CoreV1().Pods(operatorNamespace).GetLogs(pod, &corev1.PodLogOptions{}).DoRaw(context.Background())
 	return string(raw), err
-}
-
-// scrapeMetrics reads the operator metrics through the API server pod proxy,
-// which avoids a port-forward and works the same locally and in CI.
-func scrapeMetrics() string {
-	GinkgoHelper()
-	pod, err := operatorPodName()
-	Expect(err).NotTo(HaveOccurred())
-	raw, err := clientset.CoreV1().RESTClient().Get().
-		Namespace(operatorNamespace).Resource("pods").Name(pod + ":8080").
-		SubResource("proxy").Suffix("metrics").DoRaw(context.Background())
-	Expect(err).NotTo(HaveOccurred())
-	return string(raw)
-}
-
-// metricValue returns the value of an unlabeled metric from Prometheus text
-// output, or -1 if the metric is missing.
-func metricValue(metrics, name string) float64 {
-	scanner := bufio.NewScanner(strings.NewReader(metrics))
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) == 2 && fields[0] == name {
-			if v, err := strconv.ParseFloat(fields[1], 64); err == nil {
-				return v
-			}
-		}
-	}
-	return -1
 }
 
 // dumpNamespace logs the state of a failed spec's namespace to ease debugging.

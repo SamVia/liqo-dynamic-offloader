@@ -10,11 +10,10 @@ import (
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
-
-// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 func main() {
 	var targetClusterIDs string
@@ -30,6 +29,7 @@ func main() {
 	var enableTrap bool
 	var enableCleanup bool
 	var metricsAddr string
+	var leaderElectionNamespace string
 
 	flag.StringVar(&targetClusterIDs, "target-cluster-ids", "", "Comma-separated list of Target Cluster IDs. Empty delegates to Liqo.")
 	flag.StringVar(&allowedNamespaces, "allowed-namespaces", "", "Comma-separated list of namespace glob patterns to ALLOW (e.g. tenant-*). Empty allows all non-excluded namespaces.")
@@ -48,6 +48,7 @@ func main() {
 	flag.BoolVar(&enableTrap, "enable-trap", true, "Enable the LiqoTrap controller (auto-offloading of stuck pods).")
 	flag.BoolVar(&enableCleanup, "enable-cleanup", true, "Enable the LiqoCleanup controller (auto-removal of idle offloading policies).")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to. Use '0' to disable.")
+	flag.StringVar(&leaderElectionNamespace, "leader-election-namespace", "default", "Namespace where the leader election lease will be created. Set this explicitly in deployments.")
 
 	opts := zap.Options{
 		Development: true,
@@ -65,13 +66,23 @@ func main() {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		LeaderElection:          true,
 		LeaderElectionID:        "liqo-auto-healing-lock",
-		LeaderElectionNamespace: "default",
+		LeaderElectionNamespace: leaderElectionNamespace,
+		HealthProbeBindAddress:  ":8081",
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
 		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
 

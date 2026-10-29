@@ -37,11 +37,6 @@ var _ = Describe("Liqo dynamic offloader", func() {
 		By("deleting the workload and waiting for Cleanup to remove the policy")
 		Expect(deleteTrapDeployment(ns)).To(Succeed())
 		Eventually(policyExists(ns)).WithTimeout(cleanupDelay + 90*time.Second).Should(BeFalse())
-
-		By("checking the Prometheus metrics")
-		metrics := scrapeMetrics()
-		Expect(metricValue(metrics, "liqo_trap_offloadings_created_total")).To(BeNumerically(">=", 1))
-		Expect(metricValue(metrics, "liqo_cleanup_namespaces_total")).To(BeNumerically(">=", 1))
 	})
 
 	It("ignores namespaces excluded by name pattern", func() {

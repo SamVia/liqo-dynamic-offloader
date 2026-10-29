@@ -59,7 +59,7 @@ const emptySinceAnnotation = "dynamic-offloader.liqo.io/empty-since"
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
-// +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Reconcile removes a NamespaceOffloading policy after the namespace has
@@ -103,7 +103,9 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	var podList corev1.PodList
-	if err := r.List(ctx, &podList, client.InNamespace(namespace)); err != nil {
+	// Use the namespace field index registered in SetupWithManager so the
+	// cache can select only pods belonging to this reconciliation request.
+	if err := r.List(ctx, &podList, client.MatchingFields{"metadata.namespace": namespace}); err != nil {
 		logger.Error(err, "Failed to list pods in namespace")
 		return ctrl.Result{}, err
 	}
@@ -146,13 +148,15 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 		emptySinceStr, hasAnnotation := annotations[emptySinceAnnotation]
 		if !hasAnnotation {
+			originalCR := offloadCR.DeepCopy()
+
 			// Start a durable countdown instead of deleting immediately. This
 			// protects against short gaps between remote workload transitions.
 			annotations[emptySinceAnnotation] = time.Now().UTC().Format(time.RFC3339)
 			offloadCR.SetAnnotations(annotations)
 
 			if !r.DryRun {
-				if err := r.Update(ctx, offloadCR); err != nil {
+				if err := r.Patch(ctx, offloadCR, client.MergeFrom(originalCR)); err != nil {
 					return ctrl.Result{}, err
 				}
 				logger.Info("Namespace is empty. Starting cleanup countdown.", "namespace", namespace, "delay", r.CleanupDelay)
@@ -185,13 +189,15 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	} else {
 		if _, hasAnnotation := annotations[emptySinceAnnotation]; hasAnnotation {
+			originalCR := offloadCR.DeepCopy()
+
 			// New remote work invalidates the countdown and keeps the policy in
 			// place for subsequent scheduling and reconciliation.
 			delete(annotations, emptySinceAnnotation)
 			offloadCR.SetAnnotations(annotations)
 
 			if !r.DryRun {
-				if err := r.Update(ctx, offloadCR); err != nil {
+				if err := r.Patch(ctx, offloadCR, client.MergeFrom(originalCR)); err != nil {
 					return ctrl.Result{}, err
 				}
 				logger.Info("New remote pods detected. Canceled cleanup countdown.", "namespace", namespace)
@@ -321,6 +327,16 @@ func LiqoCleanupPredicate() predicate.Predicate {
 // SetupWithManager registers the cleanup reconciler for pod events and applies
 // the predicate before requests enter the controller work queue.
 func (r *LiqoCleanupReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "metadata.namespace", func(rawObj client.Object) []string {
+		pod, ok := rawObj.(*corev1.Pod)
+		if !ok {
+			return nil
+		}
+		return []string{pod.Namespace}
+	}); err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.Pod{}).
 		WithEventFilter(LiqoCleanupPredicate()).

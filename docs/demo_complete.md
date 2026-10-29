@@ -113,3 +113,13 @@ that the Cleanup Controller deletes the policy after the configured
 Use `4-locale.sh` for fast source-level feedback. Use
 `3-demo-complete.sh` when the objective is to validate the Helm chart, RBAC,
 container image pull, and in-cluster leader-election behavior.
+
+## Edge Cases & Resilience Local Validation
+
+In addition to `4-locale.sh`, the repository provides three robust, fully local scripts to validate edge cases and operator resilience without requiring Helm or a published image:
+
+*   **`scripts/5-test-resilience.sh`**: Proves that the operator can recover state and process trapped pods that were created while the operator was offline.
+*   **`scripts/6-test-edge-case.sh`**: Validates the operator's graceful handling of pods that are deleted before the reconciliation loop completes (preventing panics).
+*   **`scripts/7-test-concurrency.sh`**: Demonstrates the operator's ability to handle multiple offloading requests across different namespaces and targeting different remote clusters simultaneously.
+
+All these scripts automatically run `1-setup.sh` to ensure the correct remote clusters exist, compile the operator locally via `go build` for total process control, and feature aggressive cleanup routines to prevent orphaned processes.

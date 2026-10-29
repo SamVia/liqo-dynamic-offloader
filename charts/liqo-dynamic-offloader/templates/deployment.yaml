@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Chart.Name }}
+  name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- include "liqo-dynamic-offloader.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: {{ .Chart.Name }}
+      {{- include "liqo-dynamic-offloader.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: {{ .Chart.Name }}
+        {{- include "liqo-dynamic-offloader.selectorLabels" . | nindent 8 }}
       {{- with .Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
@@ -27,16 +27,54 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
+      {{ if .Values.metrics.enabled }}
+      - name: kube-rbac-proxy
+        image: "{{ .Values.metrics.proxy.image.repository }}:{{ .Values.metrics.proxy.image.tag }}"
+        imagePullPolicy: {{ .Values.metrics.proxy.image.pullPolicy }}
+        args:
+        - "--secure-listen-address=0.0.0.0:8443"
+        - "--upstream=http://127.0.0.1:8080/"
+        - "--logtostderr=true"
+        - "--v=0"
+        ports:
+        - name: https
+          containerPort: 8443
+          protocol: TCP
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65532
+        resources:
+          {{- toYaml .Values.metrics.proxy.resources | nindent 10 }}
+      {{ end }}
       - name: manager
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         securityContext:
           {{- toYaml .Values.securityContext | nindent 10 }}
         ports:
-        - name: metrics
-          containerPort: 8080
+        - name: health
+          containerPort: 8081
           protocol: TCP
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 10
         args:
+        - "--leader-election-namespace={{ .Release.Namespace }}"
+        - "--metrics-bind-address={{ if .Values.metrics.enabled }}127.0.0.1:8080{{ else }}0{{ end }}"
         - "--target-cluster-ids={{ .Values.config.targetClusterIDs }}"
         - "--allowed-namespaces={{ .Values.config.allowedNamespaces }}"
         - "--excluded-namespaces={{ .Values.config.excludedNamespaces }}"

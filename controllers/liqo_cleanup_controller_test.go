@@ -134,7 +134,13 @@ func TestLiqoCleanupReconciler_Reconcile(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Initialize an isolated in-memory API so each scenario validates
 			// only its own resource state and reconciliation transition.
-			fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(tt.existingObjects...).Build()
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(s).
+				WithObjects(tt.existingObjects...).
+				WithIndex(&corev1.Pod{}, "metadata.namespace", func(obj client.Object) []string {
+					return []string{obj.GetNamespace()}
+				}).
+				Build()
 
 			reconciler := &LiqoCleanupReconciler{
 				Client:             fakeClient,
@@ -197,7 +203,13 @@ func TestLiqoCleanupReconciler_EdgeCases(t *testing.T) {
 	namespace := "default"
 	ns := createCleanupNamespace(namespace)
 	offloadCR := createCleanupOffloadingCR(namespace, "")
-	fakeClient := fake.NewClientBuilder().WithScheme(s).WithObjects(ns, offloadCR).Build()
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(ns, offloadCR).
+		WithIndex(&corev1.Pod{}, "metadata.namespace", func(obj client.Object) []string {
+			return []string{obj.GetNamespace()}
+		}).
+		Build()
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
 
 	// Cover Zero Delay Path

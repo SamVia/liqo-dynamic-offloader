@@ -11,7 +11,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -52,18 +51,18 @@ type LiqoTrapReconciler struct {
 const lastRemediationAnnotation = "dynamic-offloader.liqo.io/last-remediation"
 const forceSyncAnnotation = "dynamic-offloader.liqo.io/force-sync"
 
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=offloading.liqo.io,resources=namespaceoffloadings,verbs=get;list;watch;create;patch
 
 // Reconcile handles pods trapped in Liqo's OffloadingBackOff state. It first
 // ensures that the namespace has an offloading policy, then waits for Liqo's
 // asynchronous admission and scheduling logic to process that policy.
 //
-// The pod is re-read after the wait because Liqo may recover it without further
-// intervention. If it remains trapped, the force-sync annotation requests a
-// fresh synchronization attempt. A namespace-level remediation timestamp
-// prevents repeated interventions and reconciliation hot-loops.
+// The pod is re-read after a requeue because Liqo may recover it without
+// further intervention. If it remains trapped, the force-sync annotation
+// requests a fresh synchronization attempt. A namespace-level remediation
+// timestamp prevents repeated interventions and reconciliation hot-loops.
 func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	namespaceName := req.Namespace
@@ -148,24 +147,25 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 		offloadCR.Object["spec"] = spec
 
-		if !r.DryRun {
-			if err := r.Create(ctx, offloadCR); err != nil {
-				logger.Error(err, "Failed to create NamespaceOffloading policy")
-				return ctrl.Result{}, err
-			}
-			logger.Info("Policy created. Yielding thread to allow Liqo webhooks to register.", "namespace", namespaceName)
-			liqoTrapOffloadingsCreatedTotal.Inc()
-		} else {
+		if r.DryRun {
+			// The policy is never created in dry-run, so a requeue would only
+			// repeat this branch forever. Report the whole remediation plan once.
 			logger.Info("[DRY RUN] Would create NamespaceOffloading", "namespace", namespaceName)
+			logger.Info("[DRY RUN] Would patch the stuck pod with force-sync annotation if still trapped after the backoff",
+				"pod", podName, "backoff", r.BackoffDuration)
+			return ctrl.Result{}, nil
 		}
 
-		// Yield to Liqo's mutating webhooks and asynchronous scheduling logic.
-		// The context-aware wait allows shutdown to interrupt the delay cleanly.
-		select {
-		case <-time.After(r.BackoffDuration):
-		case <-ctx.Done():
-			return ctrl.Result{}, ctx.Err()
+		if err := r.Create(ctx, offloadCR); err != nil {
+			logger.Error(err, "Failed to create NamespaceOffloading policy")
+			return ctrl.Result{}, err
 		}
+		logger.Info("Policy created. Requeueing to allow Liqo webhooks to register.", "namespace", namespaceName)
+		liqoTrapOffloadingsCreatedTotal.Inc()
+
+		// Requeue without blocking the worker while Liqo's webhooks and
+		// asynchronous scheduling logic process the new policy.
+		return ctrl.Result{RequeueAfter: r.BackoffDuration}, nil
 	} else if err != nil {
 		logger.Error(err, "Failed to fetch NamespaceOffloading policy")
 		return ctrl.Result{}, err
@@ -181,6 +181,8 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 
 		if !r.DryRun {
+			originalPod := latestPod.DeepCopy()
+
 			annotations := latestPod.GetAnnotations()
 			if annotations == nil {
 				annotations = make(map[string]string)
@@ -190,8 +192,8 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			annotations[forceSyncAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
 			latestPod.SetAnnotations(annotations)
 
-			if err := r.Update(ctx, &latestPod); err != nil {
-				logger.Error(err, "Failed to edit the stuck pod for forced sync", "pod", podName)
+			if err := r.Patch(ctx, &latestPod, client.MergeFrom(originalPod)); err != nil {
+				logger.Error(err, "Failed to patch the stuck pod for forced sync", "pod", podName)
 				return ctrl.Result{}, err
 			}
 
@@ -254,25 +256,25 @@ func (r *LiqoTrapReconciler) isNamespaceLabelsAllowed(ns *corev1.Namespace) bool
 	return true
 }
 
-// persistRemediationBackoff safely records the remediation time using
-// optimistic-lock conflict retries. This preserves namespace metadata when
-// another controller or worker updates the object concurrently.
+// persistRemediationBackoff records the remediation time on the namespace.
+// The merge patch only sends this annotation, so concurrent changes to other
+// namespace metadata are preserved without conflict retries. Concurrent
+// writers of the same annotation are harmless: the value is the current time.
 func (r *LiqoTrapReconciler) persistRemediationBackoff(ctx context.Context, namespace string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var ns corev1.Namespace
-		if err := r.Get(ctx, client.ObjectKey{Name: namespace}, &ns); err != nil {
-			return err
-		}
+	var ns corev1.Namespace
+	if err := r.Get(ctx, client.ObjectKey{Name: namespace}, &ns); err != nil {
+		return err
+	}
 
-		annotations := ns.GetAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
-		}
-		annotations[lastRemediationAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
-		ns.SetAnnotations(annotations)
+	originalNS := ns.DeepCopy()
+	annotations := ns.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	annotations[lastRemediationAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
+	ns.SetAnnotations(annotations)
 
-		return r.Update(ctx, &ns)
-	})
+	return r.Patch(ctx, &ns, client.MergeFrom(originalNS))
 }
 
 // isPodTrapped checks the pod reason and both application and init-container
