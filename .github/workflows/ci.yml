@@ -51,12 +51,15 @@ jobs:
           go-version-file: go.mod
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@8564da7cb3c6866ed1da648ca8f00a258ef0c802 # v6.5.2
+        # v7+ of the action is required to run golangci-lint v2, which the
+        # version: "2" config in .golangci.yml needs.
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          # latest picks the newest stable release automatically.
-          # Pin to a specific version (e.g. v1.59.1) if you ever need stricter
-          # reproducibility or need to work around a regression.
-          version: latest
+          # Pinned so a new golangci-lint release cannot break the pipeline
+          # without a code change.
+          version: v2.14.0
+          # Also lint the E2E suite, which is excluded without its build tag.
+          args: --build-tags e2e
 
   helm-lint:
     name: Lint Helm Chart

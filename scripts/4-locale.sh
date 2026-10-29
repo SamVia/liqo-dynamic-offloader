@@ -123,8 +123,10 @@ if [[ "$DRY_RUN" == "false" ]]; then
   echo "Deleting the stuck pod from 'demo-allowed' to trigger cleanup countdown..."
   kubectl delete deployment trap-deployment -n demo-allowed >/dev/null 2>&1
   
-  echo "Waiting for the 15s timer to expire and policy to be deleted (up to 25s)..."
-  for i in {1..13}; do
+  # The countdown starts only once the remote pod has fully terminated, and
+  # Liqo's finalizer keeps the policy briefly after deletion.
+  echo "Waiting for the pod to terminate, the 15s timer to expire and the policy to be deleted (up to 60s)..."
+  for i in {1..30}; do
     if ! kubectl get namespaceoffloading offloading -n demo-allowed >/dev/null 2>&1; then
       break
     fi

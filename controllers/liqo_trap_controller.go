@@ -11,7 +11,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -148,16 +147,21 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 		offloadCR.Object["spec"] = spec
 
-		if !r.DryRun {
-			if err := r.Create(ctx, offloadCR); err != nil {
-				logger.Error(err, "Failed to create NamespaceOffloading policy")
-				return ctrl.Result{}, err
-			}
-			logger.Info("Policy created. Requeueing to allow Liqo webhooks to register.", "namespace", namespaceName)
-			liqoTrapOffloadingsCreatedTotal.Inc()
-		} else {
+		if r.DryRun {
+			// The policy is never created in dry-run, so a requeue would only
+			// repeat this branch forever. Report the whole remediation plan once.
 			logger.Info("[DRY RUN] Would create NamespaceOffloading", "namespace", namespaceName)
+			logger.Info("[DRY RUN] Would patch the stuck pod with force-sync annotation if still trapped after the backoff",
+				"pod", podName, "backoff", r.BackoffDuration)
+			return ctrl.Result{}, nil
 		}
+
+		if err := r.Create(ctx, offloadCR); err != nil {
+			logger.Error(err, "Failed to create NamespaceOffloading policy")
+			return ctrl.Result{}, err
+		}
+		logger.Info("Policy created. Requeueing to allow Liqo webhooks to register.", "namespace", namespaceName)
+		liqoTrapOffloadingsCreatedTotal.Inc()
 
 		// Requeue without blocking the worker while Liqo's webhooks and
 		// asynchronous scheduling logic process the new policy.
@@ -252,26 +256,25 @@ func (r *LiqoTrapReconciler) isNamespaceLabelsAllowed(ns *corev1.Namespace) bool
 	return true
 }
 
-// persistRemediationBackoff safely records the remediation time using
-// optimistic-lock conflict retries. This preserves namespace metadata when
-// another controller or worker updates the object concurrently.
+// persistRemediationBackoff records the remediation time on the namespace.
+// The merge patch only sends this annotation, so concurrent changes to other
+// namespace metadata are preserved without conflict retries. Concurrent
+// writers of the same annotation are harmless: the value is the current time.
 func (r *LiqoTrapReconciler) persistRemediationBackoff(ctx context.Context, namespace string) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var ns corev1.Namespace
-		if err := r.Get(ctx, client.ObjectKey{Name: namespace}, &ns); err != nil {
-			return err
-		}
+	var ns corev1.Namespace
+	if err := r.Get(ctx, client.ObjectKey{Name: namespace}, &ns); err != nil {
+		return err
+	}
 
-		annotations := ns.GetAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
-		}
-		originalNS := ns.DeepCopy()
-		annotations[lastRemediationAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
-		ns.SetAnnotations(annotations)
+	originalNS := ns.DeepCopy()
+	annotations := ns.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	annotations[lastRemediationAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
+	ns.SetAnnotations(annotations)
 
-		return r.Patch(ctx, &ns, client.MergeFrom(originalNS))
-	})
+	return r.Patch(ctx, &ns, client.MergeFrom(originalNS))
 }
 
 // isPodTrapped checks the pod reason and both application and init-container

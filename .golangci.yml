@@ -17,9 +17,12 @@ linters:
   settings:
     errcheck:
       check-blank: false
+      # golangci-lint v2 expects fully qualified function names here.
       exclude-functions:
-        - "fmt:.*"
-        - "io:Close"
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (io.Closer).Close
     misspell:
       locale: US
   exclusions:
