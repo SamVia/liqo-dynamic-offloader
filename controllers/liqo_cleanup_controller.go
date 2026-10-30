@@ -270,6 +270,15 @@ func (r *LiqoCleanupReconciler) podTargetsAllowedCluster(ctx context.Context, po
 	if pod.Spec.NodeSelector == nil {
 		return false
 	}
+	if pod.Spec.NodeSelector["liqo.io/type"] == "virtual-node" {
+		return true
+	}
+	if remoteID, ok := pod.Spec.NodeSelector["liqo.io/remote-cluster-id"]; ok {
+		if len(r.TargetClusters) > 0 {
+			return r.clusterAllowed(remoteID)
+		}
+		return true
+	}
 	target := pod.Spec.NodeSelector["kubernetes.io/hostname"]
 	if len(r.TargetClusters) > 0 {
 		return r.clusterAllowed(target)
@@ -297,12 +306,12 @@ func (r *LiqoCleanupReconciler) isLiqoRemotePod(ctx context.Context, pod *corev1
 	if len(r.TargetClusters) == 0 {
 		return remoteClusterID != "" || r.checkRemoteNode(ctx, pod.Spec.NodeName) || strings.HasPrefix(pod.Spec.NodeName, "virtual-node-")
 	}
-	return r.clusterAllowed(remoteClusterID) || r.clusterAllowed(pod.Spec.NodeName) || r.clusterAllowed(pod.Spec.NodeSelector["kubernetes.io/hostname"])
+	return r.clusterAllowed(remoteClusterID) || r.clusterAllowed(pod.Spec.NodeName) || r.clusterAllowed(pod.Spec.NodeSelector["kubernetes.io/hostname"]) || r.clusterAllowed(pod.Spec.NodeSelector["liqo.io/remote-cluster-id"])
 }
 
 // isLiqoRemoteNode identifies Liqo virtual nodes by metadata or name prefix.
 func isLiqoRemoteNode(node corev1.Node) bool {
-	return node.Labels["liqo.io/remote-cluster-id"] != "" || strings.HasPrefix(node.Name, "virtual-node-")
+	return node.Labels["liqo.io/remote-cluster-id"] != "" || strings.HasPrefix(node.Name, "virtual-node-") || node.Labels["liqo.io/type"] == "virtual-node"
 }
 
 // LiqoCleanupPredicate filters events to pod lifecycle changes that can alter
