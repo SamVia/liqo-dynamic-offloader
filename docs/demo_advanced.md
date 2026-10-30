@@ -266,7 +266,7 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
     // Exclude critical system namespaces to avoid inadvertently applying 
     // offloading policies to core control plane or storage components.
-    if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" || namespace == "crownlabs-system" {
+    if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" {
         return ctrl.Result{}, nil
     }
 
@@ -404,7 +404,7 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
     namespace := req.Namespace
 
     // Exclude system and critical namespaces to prevent accidental deletion of their offloading configurations.
-    if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" || namespace == "crownlabs-system" {
+    if namespace == "kube-system" || namespace == "liqo-system" || namespace == "local-path-storage" {
         return ctrl.Result{}, nil
     }
 

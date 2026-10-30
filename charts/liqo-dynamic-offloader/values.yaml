@@ -32,7 +32,7 @@ affinity: {}
 config:
   targetClusterIDs: ""
   allowedNamespaces: ""
-  excludedNamespaces: "kube-*,*-system,local-path-storage,crownlabs-system"
+  excludedNamespaces: "kube-*,*-system,local-path-storage"
   trapWhitelistLabels: ""
   trapBlacklistLabels: ""
   cleanupWhitelistLabels: ""
