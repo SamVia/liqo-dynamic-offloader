@@ -2,16 +2,18 @@
 
 This document outlines the testing strategies used to validate the robustness, concurrency handling, and state-reconciliation capabilities of the **Liqo Dynamic Offloader** operator.
 
-We have provided three automated Bash scripts that demonstrate the operator's behavior under stressful or unexpected cluster conditions. The scripts run the operator locally against Kind clusters and automatically invoke the setup script to prepare the required clusters if they do not exist. Scripts 5 and 7 compile the operator with `go build`; script 6 runs it with `go run`. All three scripts include cleanup for local processes and test resources.
+We have provided four automated Bash scripts that demonstrate the operator's behavior under stressful or unexpected cluster conditions. The scripts run the operator locally against Kind clusters and automatically invoke the setup script to prepare the required clusters if they do not exist. Scripts 5, 7, and 8 compile the operator with `go build`; script 6 runs it with `go run`. All scripts include automated cleanup for local processes and test resources.
 
 ### Prerequisites
 
-The scripts require Docker, Kind, `kubectl`, `liqoctl`, Go, and Bash, Git Bash, or WSL. Run them from the repository root. The setup script installs Liqo and peers the local cluster with the configured remote cluster(s):
+The scripts require Docker, Kind, `kubectl`, `liqoctl` (v1.2.0 or newer), Go (1.22+), and Bash, Git Bash, or WSL. Run them from the repository root:
 
 ```bash
+chmod +x scripts/*.sh
 ./scripts/5-test-resilience.sh
 ./scripts/6-test-edge-case.sh
 ./scripts/7-test-concurrency.sh
+./scripts/8-test-multi-cluster-spread.sh
 ```
 
 ---
@@ -64,3 +66,58 @@ In a large multi-tenant cluster, multiple namespaces might deploy workloads targ
 
 ### What it Proves
 This demonstrates that the controller can process offloading requests for multiple namespaces and target clusters without cross-contaminating their policies. Because the two deployments are applied sequentially, the script does not independently measure simultaneous request submission or prove a particular reconciliation scheduling order. The observed behavior is consistent with requeue-based reconciliation, which avoids blocking a worker with a synchronous `time.Sleep()`.
+
+---
+
+## 4. Multi-Cluster Pod Distribution (Topology Spread)
+**Script:** `8-test-multi-cluster-spread.sh`
+
+### The Scenario
+When peering with multiple remote clusters (`cluster-remote` and `cluster-alpha`), an operator configured with multiple target clusters (`--target-cluster-ids=cluster-remote,cluster-alpha`) generates a `NamespaceOffloading` policy with a `clusterSelector` admitting both clusters. 
+
+This test proves that a single policy genuinely enables multi-cluster offloading for all allowed targets and allows multi-replica workloads to spread dynamically across all peered virtual nodes without hardcoding hostnames on individual pods.
+
+### What the Script Does
+1. Launches the local operator configured with `--target-cluster-ids="cluster-remote,cluster-alpha"`.
+2. Creates a single namespace (`test-cluster-spread`).
+3. Deploys a workload with 4 replicas configured with:
+   * Generic virtual node selector: `nodeSelector: {"liqo.io/type": "virtual-node"}`.
+   * Liqo taint toleration: `tolerations: [{key: "virtual-node.liqo.io/not-allowed", operator: "Exists"}]`.
+   * Topology spread constraint: `topologySpreadConstraints` on `kubernetes.io/hostname` to distribute replicas evenly.
+4. Verifies that the Trap controller creates `NamespaceOffloading` covering both clusters, recovers the pods from `OffloadingBackOff`, and achieves `Running` status on both `cluster-remote` and `cluster-alpha`.
+5. Deletes the workload and verifies that the Cleanup controller revokes the offloading policy when the namespace becomes idle.
+
+### How to Run
+```bash
+./scripts/8-test-multi-cluster-spread.sh
+```
+
+### Verified Execution Output
+```text
+=== Multi-Cluster Distribution Analysis ===
+NAME                                READY   STATUS    RESTARTS   AGE   IP           NODE             NOMINATED NODE   READINESS GATES
+spread-deployment-599887985-hbqvv   1/1     Running   0          15s   10.71.0.13   cluster-remote   <none>           <none>
+spread-deployment-599887985-hv8cs   1/1     Running   0          15s   10.71.0.12   cluster-remote   <none>           <none>
+spread-deployment-599887985-qm7j9   1/1     Running   0          15s   10.69.0.12   cluster-alpha    <none>           <none>
+spread-deployment-599887985-rwnqp   1/1     Running   0          15s   10.69.0.13   cluster-alpha    <none>           <none>
+
+------------------------------------------------------------
+Pods on cluster-remote: 2
+Pods on cluster-alpha:  2
+------------------------------------------------------------
+[SUCCESS] A single NamespaceOffloading policy successfully distributed the workload across BOTH peered clusters!
+
+=== Testing Phase 2: Cleanup Controller Verification ===
+Deleting deployment to test automated policy revocation when namespace is idle...
+Waiting for cleanup countdown and policy deletion (up to 35s)...
+[SUCCESS] NamespaceOffloading policy was successfully cleaned up after workload ended!
+
+=== Test 8 Completed Successfully ===
+```
+
+### What it Proves & Difference with Test 7
+* **Test 7 vs. Test 8 Distinction:**
+  * In **Test 7**, two namespaces each contain a pod explicitly pinned via `nodeSelector: {"kubernetes.io/hostname": "<node>"}`. It demonstrates multi-namespace concurrency and isolation without cross-contamination.
+  * In **Test 8**, a single namespace runs a multi-replica deployment without hardcoded node names (`nodeSelector: {"liqo.io/type": "virtual-node"}`). It confirms that a single `NamespaceOffloading` policy created with `--target-cluster-ids=cluster-remote,cluster-alpha` genuinely allows the native Kubernetes scheduler (`topologySpreadConstraints`) to distribute workloads across all peered Liqo remote clusters.
+* **Automated Cleanup:** It additionally confirms that once all distributed pods are deleted, the Cleanup controller detects zero active remote workloads across all peered clusters and safely tears down the policy.
+

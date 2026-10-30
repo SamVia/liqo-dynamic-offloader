@@ -203,7 +203,8 @@ For development and controller behavior validation without building or deploying
 *   **`scripts/4-locale.sh`**: Validates the core namespace filtering and cleanup behavior.
 *   **`scripts/5-test-resilience.sh`**: Tests the operator's ability to recover missed events after a crash or downtime.
 *   **`scripts/6-test-edge-case.sh`**: Verifies the operator does not panic when a trapped pod is deleted mid-reconciliation.
-*   **`scripts/7-test-concurrency.sh`**: Evaluates the operator's performance when simultaneously handling offloading events for multiple namespaces and multiple target clusters (`cluster-alpha` and `cluster-beta`).
+*   **`scripts/7-test-concurrency.sh`**: Evaluates the operator's performance when simultaneously handling offloading events for multiple namespaces and multiple target clusters (`cluster-remote` and `cluster-alpha`).
+*   **`scripts/8-test-multi-cluster-spread.sh`**: Proves that a single `NamespaceOffloading` policy created with multiple target clusters (`cluster-remote,cluster-alpha`) distributes multi-replica workloads across all peered virtual nodes using `topologySpreadConstraints`.
 
 These scripts automatically ensure the necessary infrastructure is present by invoking `1-setup.sh` as needed.
 

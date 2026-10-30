@@ -27,7 +27,7 @@ kubectl delete deployment liqo-auto-healing-operator \
   --ignore-not-found=true --wait=true
 
 echo "5/5 Cleaning up Test Namespaces..."
-kubectl delete namespace demo-not-selected demo-allowed demo-system demo-labeled test-resilience test-edge-case test-cluster-alpha test-cluster-beta \
+kubectl delete namespace demo-not-selected demo-allowed demo-system demo-labeled test-resilience test-edge-case test-cluster-remote test-cluster-alpha test-cluster-beta test-cluster-spread \
   --ignore-not-found=true --wait=true
 
 echo -e "\033[1;32m\nStage Reset Complete!\033[0m"

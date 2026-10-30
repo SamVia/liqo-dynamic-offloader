@@ -195,6 +195,18 @@ Helm e non scarica immagini container. È pensato per un feedback rapido
 durante lo sviluppo; usare la demo Helm per validare il deployment impacchettato
 ed eseguito nel cluster.
 
+## Validazione Locale dell'Operatore
+
+Per lo sviluppo e la validazione del comportamento dei controller senza creare o distribuire un container, il repository include diversi script nella cartella scripts/. Questi script compilano l'operatore localmente (go build o go run) e includono meccanismi di pulizia per evitare processi orfani:
+
+*   **scripts/4-locale.sh**: Valida il filtraggio dei namespace e il cleanup automatico di base.
+*   **scripts/5-test-resilience.sh**: Testa il ripristino dello stato e il recupero di pod bloccati dopo un crash o riavvio dell'operatore.
+*   **scripts/6-test-edge-case.sh**: Verifica che l'eliminazione improvvisa di un pod durante la riconciliazione non causi panics o crash.
+*   **scripts/7-test-concurrency.sh**: Valuta la concorrenza multi-namespace su cluster remoti distinti (cluster-remote e cluster-alpha).
+*   **scripts/8-test-multi-cluster-spread.sh**: Dimostra che una singola policy NamespaceOffloading creata con piu target (cluster-remote,cluster-alpha) consente lo spread bilanciato delle repliche su tutti i nodi virtuali remoti tramite 	opologySpreadConstraints.
+
+Questi script invocano automaticamente 1-setup.sh per garantire che l'infrastruttura richiesta sia presente.
+
 ## Deployment Helm
 
 Il metodo consigliato per gli ambienti di produzione è il chart Helm in
