@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
@@ -148,6 +149,15 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 		emptySinceStr, hasAnnotation := annotations[emptySinceAnnotation]
 		if !hasAnnotation {
+			if r.DryRun {
+				// The annotation is never written in dry-run, so a requeue would
+				// only repeat this branch forever. Report the whole plan once.
+				logger.Info("[DRY RUN] Would set empty-since annotation", "namespace", namespace)
+				logger.Info("[DRY RUN] Would delete NamespaceOffloading if the namespace stays empty for the cleanup delay",
+					"namespace", namespace, "delay", r.CleanupDelay)
+				return ctrl.Result{}, nil
+			}
+
 			originalCR := offloadCR.DeepCopy()
 
 			// Start a durable countdown instead of deleting immediately. This
@@ -155,18 +165,39 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			annotations[emptySinceAnnotation] = time.Now().UTC().Format(time.RFC3339)
 			offloadCR.SetAnnotations(annotations)
 
-			if !r.DryRun {
-				if err := r.Patch(ctx, offloadCR, client.MergeFrom(originalCR)); err != nil {
-					return ctrl.Result{}, err
-				}
-				logger.Info("Namespace is empty. Starting cleanup countdown.", "namespace", namespace, "delay", r.CleanupDelay)
-			} else {
-				logger.Info("[DRY RUN] Would set empty-since annotation", "namespace", namespace)
+			if err := r.Patch(ctx, offloadCR, client.MergeFrom(originalCR)); err != nil {
+				return ctrl.Result{}, err
 			}
+			logger.Info("Namespace is empty. Starting cleanup countdown.", "namespace", namespace, "delay", r.CleanupDelay)
 			return ctrl.Result{RequeueAfter: r.CleanupDelay}, nil
 		}
 
-		emptySince, _ := time.Parse(time.RFC3339, emptySinceStr)
+		emptySince, err := time.Parse(time.RFC3339, emptySinceStr)
+		if err != nil {
+			// An unreadable value would parse as the zero time and delete the
+			// policy at once, skipping the grace period. Restart the countdown
+			// from now instead, and say so on the policy.
+			if r.DryRun {
+				logger.Info("[DRY RUN] Would restart cleanup countdown: invalid empty-since annotation", "namespace", namespace, "value", emptySinceStr)
+				return ctrl.Result{}, nil
+			}
+
+			restartedAt := time.Now().UTC().Format(time.RFC3339)
+			originalCR := offloadCR.DeepCopy()
+			annotations[emptySinceAnnotation] = restartedAt
+			offloadCR.SetAnnotations(annotations)
+
+			if err := r.Patch(ctx, offloadCR, client.MergeFrom(originalCR)); err != nil {
+				return ctrl.Result{}, err
+			}
+			logger.Info("Invalid empty-since annotation. Restarted cleanup countdown.",
+				"namespace", namespace, "invalidValue", emptySinceStr, "emptySince", restartedAt)
+			if r.Recorder != nil {
+				r.Recorder.Event(offloadCR, corev1.EventTypeWarning, "InvalidEmptySince",
+					fmt.Sprintf("Ignored invalid %s value %q; cleanup countdown restarted at %s.", emptySinceAnnotation, emptySinceStr, restartedAt))
+			}
+			return ctrl.Result{RequeueAfter: r.CleanupDelay}, nil
+		}
 		if time.Since(emptySince) >= r.CleanupDelay {
 			if !r.DryRun {
 				// Delete only after the namespace has stayed empty for the full
