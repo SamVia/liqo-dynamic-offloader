@@ -71,10 +71,8 @@ const emptySinceAnnotation = "dynamic-offloader.liqo.io/empty-since"
 // rather than an in-memory timer.
 func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	// Requests come from pod events, so they always carry the pod's namespace.
 	namespace := req.Namespace
-	if namespace == "" {
-		namespace = req.Name
-	}
 
 	// Fail fast: validate namespace name patterns BEFORE any API server Get
 	if !r.isNamespaceNameAllowed(namespace) {
@@ -118,9 +116,8 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	for _, pod := range podList.Items {
 		explicitTarget := r.podTargetsAllowedCluster(ctx, &pod)
 		scheduledRemote := r.isLiqoRemotePod(ctx, &pod)
-		isPendingRemote := pod.Status.Phase == corev1.PodPending && pod.Spec.NodeName == "" && explicitTarget
 
-		if explicitTarget || scheduledRemote || isPendingRemote {
+		if explicitTarget || scheduledRemote {
 			isTerminating := !pod.DeletionTimestamp.IsZero()
 			isTerminalPhase := pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 

@@ -18,6 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 // Helper function to mock a Namespace with optional labels.
@@ -605,5 +606,35 @@ func TestLiqoTrapReconciler_RecoveredPod(t *testing.T) {
 	_ = fakeClient.Get(ctx, req.NamespacedName, &pod)
 	if pod.GetAnnotations()[forceSyncAnnotation] != "" {
 		t.Errorf("A recovered pod was patched with the force-sync annotation")
+	}
+}
+
+// TestLiqoTrapReconciler_PolicyCreatedConcurrently verifies that losing the
+// race to create the policy is not treated as an error.
+func TestLiqoTrapReconciler_PolicyCreatedConcurrently(t *testing.T) {
+	ctx := context.TODO()
+	s := scheme.Scheme
+	_ = corev1.AddToScheme(s)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(createNamespace("default", nil), createStuckPod("stuck-pod", "default")).
+		WithInterceptorFuncs(interceptor.Funcs{
+			// Simulate another worker creating the policy first.
+			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+				return apierrors.NewAlreadyExists(schema.GroupResource{Group: "offloading.liqo.io", Resource: "namespaceoffloadings"}, obj.GetName())
+			},
+		}).Build()
+	reconciler := &LiqoTrapReconciler{
+		Client:          fakeClient,
+		BackoffDuration: time.Second,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "stuck-pod", Namespace: "default"}}
+	result, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("AlreadyExists must not be reported as an error, got: %v", err)
+	}
+	if result.RequeueAfter != reconciler.BackoffDuration {
+		t.Errorf("RequeueAfter = %v; want %v to check the pod again", result.RequeueAfter, reconciler.BackoffDuration)
 	}
 }

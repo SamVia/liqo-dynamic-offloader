@@ -78,9 +78,6 @@ const maxForceSyncDelay = 5 * time.Minute
 func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	namespaceName := req.Namespace
-	if namespaceName == "" {
-		namespaceName = req.Name
-	}
 	podName := req.Name
 
 	// Fail fast: validate namespace name patterns BEFORE any API server Get
@@ -176,8 +173,14 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 
 		if err := r.Create(ctx, offloadCR); err != nil {
-			logger.Error(err, "Failed to create NamespaceOffloading policy")
-			return ctrl.Result{}, err
+			if !apierrors.IsAlreadyExists(err) {
+				logger.Error(err, "Failed to create NamespaceOffloading policy")
+				return ctrl.Result{}, err
+			}
+			// Another worker or replica created it in the meantime. The policy
+			// exists, which is all this pass needed: check the pod again later.
+			logger.V(1).Info("NamespaceOffloading was created concurrently.", "namespace", namespaceName)
+			return ctrl.Result{RequeueAfter: r.BackoffDuration}, nil
 		}
 		logger.Info("Policy created. Requeueing to allow Liqo webhooks to register.", "namespace", namespaceName)
 		liqoTrapOffloadingsCreatedTotal.Inc()
