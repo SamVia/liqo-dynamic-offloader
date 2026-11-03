@@ -109,7 +109,14 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
-	logger.Info("TRIGGER FAIL-FAST: Pod in OffloadingBackOff intercepted!", "namespace", namespaceName, "pod", podName)
+	if !isPodTrapped(&stuckPod) {
+		// Requeues bypass the predicate, so the pod may have recovered since it
+		// was queued. Stop here: a recovered pod needs no policy and no sync.
+		logger.Info("Pod is no longer in OffloadingBackOff. Nothing to do.", "pod", podName)
+		return ctrl.Result{}, nil
+	}
+
+	logger.V(1).Info("TRIGGER FAIL-FAST: Pod in OffloadingBackOff intercepted!", "namespace", namespaceName, "pod", podName)
 
 	// Enforce the persisted namespace-level remediation cooldown before mutating
 	// resources. Persisting this timestamp makes the cooldown survive restarts
@@ -191,69 +198,55 @@ func (r *LiqoTrapReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{RequeueAfter: r.BackoffDuration}, nil
 	}
 
-	// Re-read the pod because Liqo may have recovered it during the backoff.
-	// Avoid annotating a pod that is no longer trapped.
-	var latestPod corev1.Pod
-	if err := r.Get(ctx, req.NamespacedName, &latestPod); err == nil {
-		if !isPodTrapped(&latestPod) {
-			logger.Info("Pod successfully auto-recovered by Liqo during backoff. Skipping edit.", "pod", podName)
-			return ctrl.Result{}, nil
+	if r.DryRun {
+		// Dry-run evaluates the same recovery path but does not create,
+		// update, or annotate any cluster resource.
+		logger.Info("[DRY RUN] Would patch the stuck pod with force-sync annotation", "pod", podName)
+		return ctrl.Result{}, nil
+	}
+
+	attempts := forceSyncAttempts(&stuckPod)
+	if r.MaxForceSyncAttempts > 0 && attempts >= r.MaxForceSyncAttempts {
+		// Stop retrying a pod that never recovers, for example because the
+		// policy excludes its cluster or the remote cluster is down.
+		logger.Info("Force-sync limit reached. Giving up on the pod.", "pod", podName, "attempts", attempts)
+		r.recordEvent(&stuckPod, corev1.EventTypeWarning, "ForceSyncLimitReached",
+			fmt.Sprintf("Still in OffloadingBackOff after %d force-sync attempts. Check the NamespaceOffloading policy and the remote cluster, then delete the pod to retry.", attempts))
+		return ctrl.Result{}, nil
+	}
+	if attempts > 0 {
+		// Space retries out exponentially, measured from the last sync.
+		if remaining := forceSyncDelay(r.BackoffDuration, attempts) - time.Since(lastForceSync(&stuckPod)); remaining > 0 {
+			return ctrl.Result{RequeueAfter: remaining}, nil
 		}
+	}
 
-		if !r.DryRun {
-			attempts := forceSyncAttempts(&latestPod)
-			if r.MaxForceSyncAttempts > 0 && attempts >= r.MaxForceSyncAttempts {
-				// Stop retrying a pod that never recovers, for example because the
-				// policy excludes its cluster or the remote cluster is down.
-				logger.Info("Force-sync limit reached. Giving up on the pod.", "pod", podName, "attempts", attempts)
-				r.recordEvent(&latestPod, corev1.EventTypeWarning, "ForceSyncLimitReached",
-					fmt.Sprintf("Still in OffloadingBackOff after %d force-sync attempts. Check the NamespaceOffloading policy and the remote cluster, then delete the pod to retry.", attempts))
-				return ctrl.Result{}, nil
-			}
-			if attempts > 0 {
-				// Space retries out exponentially, measured from the last sync.
-				if remaining := forceSyncDelay(r.BackoffDuration, attempts) - time.Since(lastForceSync(&latestPod)); remaining > 0 {
-					return ctrl.Result{RequeueAfter: remaining}, nil
-				}
-			}
+	originalPod := stuckPod.DeepCopy()
 
-			originalPod := latestPod.DeepCopy()
+	annotations := stuckPod.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	// The timestamp changes the pod object and asks downstream Liqo
+	// components to process a new synchronization attempt.
+	annotations[forceSyncAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
+	annotations[forceSyncAttemptsAnnotation] = strconv.Itoa(attempts + 1)
+	stuckPod.SetAnnotations(annotations)
 
-			annotations := latestPod.GetAnnotations()
-			if annotations == nil {
-				annotations = make(map[string]string)
-			}
-			// The timestamp changes the pod object and asks downstream Liqo
-			// components to process a new synchronization attempt.
-			annotations[forceSyncAnnotation] = time.Now().UTC().Format(time.RFC3339Nano)
-			annotations[forceSyncAttemptsAnnotation] = strconv.Itoa(attempts + 1)
-			latestPod.SetAnnotations(annotations)
-
-			if err := r.Patch(ctx, &latestPod, client.MergeFrom(originalPod)); err != nil {
-				logger.Error(err, "Failed to patch the stuck pod for forced sync", "pod", podName)
-				return ctrl.Result{}, err
-			}
-
-			if err := r.persistRemediationBackoff(ctx, namespaceName); err != nil {
-				logger.Error(err, "Failed to persist namespace remediation backoff", "namespace", namespaceName)
-				return ctrl.Result{}, err
-			}
-			logger.Info("Successfully patched the stuck pod to trigger kubelet sync.", "pod", podName, "attempt", attempts+1)
-
-			// Check again later even without new events, so a pod that stays
-			// trapped gets its next attempt or reaches the limit.
-			return ctrl.Result{RequeueAfter: forceSyncDelay(r.BackoffDuration, attempts+1)}, nil
-		} else {
-			// Dry-run evaluates the same recovery path but does not create,
-			// update, or annotate any cluster resource.
-			logger.Info("[DRY RUN] Would patch the stuck pod with force-sync annotation", "pod", podName)
-		}
-
-	} else if !apierrors.IsNotFound(err) {
+	if err := r.Patch(ctx, &stuckPod, client.MergeFrom(originalPod)); err != nil {
+		logger.Error(err, "Failed to patch the stuck pod for forced sync", "pod", podName)
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	if err := r.persistRemediationBackoff(ctx, namespaceName); err != nil {
+		logger.Error(err, "Failed to persist namespace remediation backoff", "namespace", namespaceName)
+		return ctrl.Result{}, err
+	}
+	logger.Info("Successfully patched the stuck pod to trigger kubelet sync.", "pod", podName, "attempt", attempts+1)
+
+	// Check again later even without new events, so a pod that stays
+	// trapped gets its next attempt or reaches the limit.
+	return ctrl.Result{RequeueAfter: forceSyncDelay(r.BackoffDuration, attempts+1)}, nil
 }
 
 // isNamespaceNameAllowed evaluates globbing patterns on the namespace name

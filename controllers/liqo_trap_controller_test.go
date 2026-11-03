@@ -564,3 +564,46 @@ func TestForceSyncDelay(t *testing.T) {
 		}
 	}
 }
+
+// TestLiqoTrapReconciler_RecoveredPod verifies that a reconcile reaching a pod
+// that is no longer trapped, as happens after a requeue, changes nothing: no
+// policy is created and the pod is not patched.
+func TestLiqoTrapReconciler_RecoveredPod(t *testing.T) {
+	ctx := context.TODO()
+	s := scheme.Scheme
+	_ = corev1.AddToScheme(s)
+
+	recoveredPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "web-1", Namespace: "default"},
+		Spec:       corev1.PodSpec{NodeSelector: map[string]string{"kubernetes.io/hostname": "cluster-remote"}},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(createNamespace("default", nil), recoveredPod).Build()
+	reconciler := &LiqoTrapReconciler{
+		Client:          fakeClient,
+		TargetClusters:  []string{"cluster-remote"},
+		BackoffDuration: time.Second,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "web-1", Namespace: "default"}}
+	result, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter = %v; want no requeue for a recovered pod", result.RequeueAfter)
+	}
+
+	policy := &unstructured.Unstructured{}
+	policy.SetGroupVersionKind(schema.GroupVersionKind{Group: "offloading.liqo.io", Version: "v1beta1", Kind: "NamespaceOffloading"})
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: "offloading", Namespace: "default"}, policy); !apierrors.IsNotFound(err) {
+		t.Errorf("A NamespaceOffloading was created for a pod that is not trapped")
+	}
+
+	var pod corev1.Pod
+	_ = fakeClient.Get(ctx, req.NamespacedName, &pod)
+	if pod.GetAnnotations()[forceSyncAnnotation] != "" {
+		t.Errorf("A recovered pod was patched with the force-sync annotation")
+	}
+}
