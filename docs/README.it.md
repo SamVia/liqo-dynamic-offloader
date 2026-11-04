@@ -97,7 +97,7 @@ In aggiunta ai log strutturati, ogni cleanup completato produce un evento Kubern
 - [kind](https://kind.sigs.k8s.io/)
 - `kubectl`
 - `liqoctl` 1.0 o successivo
-- Go 1.22 o successivo
+- Go 1.26 o successivo
 - Bash, Git Bash o WSL per eseguire gli script `.sh` su Windows
 
 Gli script creano due cluster kind denominati `cluster-local` e `cluster-remote`, installano Liqo e li collegano tramite un gateway NodePort.

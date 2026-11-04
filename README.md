@@ -99,7 +99,7 @@ In addition to structured logs, every completed cleanup produces a native Kubern
 * [kind](https://kind.sigs.k8s.io/?utm_source=gemini)
 * `kubectl`
 * `liqoctl` 1.0 or newer
-* Go 1.22 or newer
+* Go 1.26 or newer
 * Bash, Git Bash, or WSL to run `.sh` scripts on Windows
 
 The scripts create two kind clusters named `cluster-local` and `cluster-remote`, install Liqo, and link them via a NodePort gateway.

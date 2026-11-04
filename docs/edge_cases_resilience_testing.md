@@ -6,7 +6,7 @@ We have provided four automated Bash scripts that demonstrate the operator's beh
 
 ### Prerequisites
 
-The scripts require Docker, Kind, `kubectl`, `liqoctl` (v1.2.0 or newer), Go (1.22+), and Bash, Git Bash, or WSL. Run them from the repository root:
+The scripts require Docker, Kind, `kubectl`, `liqoctl` (v1.2.0 or newer), Go (1.26+), and Bash, Git Bash, or WSL. Run them from the repository root:
 
 ```bash
 chmod +x scripts/*.sh
