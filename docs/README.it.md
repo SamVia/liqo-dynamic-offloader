@@ -36,7 +36,9 @@ Quando rileva il trap, ignora i namespace esclusi e i pod già in terminazione. 
 - usa `podOffloadingStrategy: LocalAndRemote`;
 - vincola l'offloading tramite l'etichetta `liqo.io/remote-cluster-id` se i cluster sono specificati con `--target-cluster-ids`, altrimenti delega la scelta a Liqo;
 - attende il periodo `--trap-backoff`, lasciando il tempo alla logica asincrona di ammissione e schedulazione di Liqo di elaborare la nuova policy;
-- rilegge il pod dopo l'attesa e applica l'annotazione `force-sync` solo se è ancora in `OffloadingBackOff`.
+- rilegge il pod dopo l'attesa e applica l'annotazione `force-sync` solo se è ancora in `OffloadingBackOff`;
+- distanzia i tentativi di `force-sync` sullo stesso pod in modo esponenziale (il periodo `--trap-backoff`, raddoppiato a ogni tentativo, fino a 5 minuti) e si ferma dopo `--trap-max-force-sync` tentativi, lasciando sul pod un evento di warning `ForceSyncLimitReached`;
+- se la policy è in cancellazione, attende che venga eliminata e poi la ricrea.
 
 Se la policy esiste già, il controller rispetta il cooldown della remediation a livello di namespace prima di procedere. Se Liqo ha già recuperato il pod durante il backoff, non viene eseguita alcuna modifica. In modalità dry-run vengono registrate le azioni previste senza creare o aggiornare risorse.
 
@@ -68,6 +70,7 @@ L'operatore viene configurato all'avvio tramite flag della riga di comando. Il c
 | `--cleanup-whitelist-labels` | Label `key=value` richieste sul namespace per abilitare il Cleanup Controller. | *(vuoto)* |
 | `--cleanup-blacklist-labels` | Label `key=value` che disabilitano il Cleanup Controller sul namespace. | *(vuoto)* |
 | `--trap-backoff` | Durata dell'attesa prima di ricontrollare un pod bloccato. | `2s` |
+| `--trap-max-force-sync` | Tentativi di `force-sync` per pod bloccato prima di rinunciare. `0` significa illimitati. | `5` |
 | `--cleanup-delay` | Conto alla rovescia prima di eliminare una policy vuota. `0` disabilita la pulizia automatica. | `10s` |
 | `--enable-trap` | Abilita il controller LiqoTrap (auto-offloading dei pod bloccati). | `true` |
 | `--enable-cleanup` | Abilita il controller LiqoCleanup (rimozione automatica delle policy vuote). | `true` |
@@ -94,7 +97,7 @@ In aggiunta ai log strutturati, ogni cleanup completato produce un evento Kubern
 - [kind](https://kind.sigs.k8s.io/)
 - `kubectl`
 - `liqoctl` 1.0 o successivo
-- Go 1.22 o successivo
+- Go 1.26 o successivo
 - Bash, Git Bash o WSL per eseguire gli script `.sh` su Windows
 
 Gli script creano due cluster kind denominati `cluster-local` e `cluster-remote`, installano Liqo e li collegano tramite un gateway NodePort.
@@ -191,6 +194,18 @@ A differenza di `3-demo-complete.sh`, questo script non installa una release
 Helm e non scarica immagini container. È pensato per un feedback rapido
 durante lo sviluppo; usare la demo Helm per validare il deployment impacchettato
 ed eseguito nel cluster.
+
+## Validazione Locale dell'Operatore
+
+Per lo sviluppo e la validazione del comportamento dei controller senza creare o distribuire un container, il repository include diversi script nella cartella scripts/. Questi script compilano l'operatore localmente (go build o go run) e includono meccanismi di pulizia per evitare processi orfani:
+
+*   **scripts/4-locale.sh**: Valida il filtraggio dei namespace e il cleanup automatico di base.
+*   **scripts/5-test-resilience.sh**: Testa il ripristino dello stato e il recupero di pod bloccati dopo un crash o riavvio dell'operatore.
+*   **scripts/6-test-edge-case.sh**: Verifica che l'eliminazione improvvisa di un pod durante la riconciliazione non causi panics o crash.
+*   **scripts/7-test-concurrency.sh**: Valuta la concorrenza multi-namespace su cluster remoti distinti (cluster-remote e cluster-alpha).
+*   **scripts/8-test-multi-cluster-spread.sh**: Dimostra che una singola policy NamespaceOffloading creata con piu target (cluster-remote,cluster-alpha) consente lo spread bilanciato delle repliche su tutti i nodi virtuali remoti tramite 	opologySpreadConstraints.
+
+Questi script invocano automaticamente 1-setup.sh per garantire che l'infrastruttura richiesta sia presente.
 
 ## Deployment Helm
 

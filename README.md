@@ -38,6 +38,8 @@ The main process in `main.go` starts a single `controller-runtime` manager with 
   * Waits for the `--trap-backoff` period, allowing Liqo's asynchronous admission and scheduling logic to process the new policy.
   * Re-reads the pod after the wait and applies the force-sync annotation only if it is still in `OffloadingBackOff`.
 
+  Force-sync attempts on the same pod are spaced out exponentially (the `--trap-backoff` period, doubled after each attempt, up to 5 minutes) and stop after `--trap-max-force-sync` attempts, with a `ForceSyncLimitReached` warning event on the pod. If the policy is being deleted, the controller waits for the deletion to complete and then recreates it.
+
   If the policy already exists, the controller respects the namespace-level remediation cooldown before proceeding. If Liqo has already recovered the pod during the backoff, no mutation is performed. Dry-run mode logs the intended action without creating or updating resources.
 
 ### Cleanup Controller
@@ -69,6 +71,7 @@ The operator is configured at startup through command-line flags. The Helm chart
 | `--cleanup-whitelist-labels` | Namespace `key=value` labels required to enable Cleanup. | *(empty)* |
 | `--cleanup-blacklist-labels` | Namespace `key=value` labels that disable Cleanup. | *(empty)* |
 | `--trap-backoff` | Wait duration before rechecking a trapped pod. | `2s` |
+| `--trap-max-force-sync` | Force-sync attempts per trapped pod before giving up. `0` means unlimited. | `5` |
 | `--cleanup-delay` | Countdown before deleting an empty offloading policy. `0` disables automatic cleanup. | `10s` |
 | `--enable-trap` | Enables the LiqoTrap controller (auto-offloading of trapped pods). | `true` |
 | `--enable-cleanup` | Enables the LiqoCleanup controller (auto-removal of empty offloading policies). | `true` |
@@ -96,7 +99,7 @@ In addition to structured logs, every completed cleanup produces a native Kubern
 * [kind](https://kind.sigs.k8s.io/?utm_source=gemini)
 * `kubectl`
 * `liqoctl` 1.0 or newer
-* Go 1.22 or newer
+* Go 1.26 or newer
 * Bash, Git Bash, or WSL to run `.sh` scripts on Windows
 
 The scripts create two kind clusters named `cluster-local` and `cluster-remote`, install Liqo, and link them via a NodePort gateway.
@@ -200,7 +203,8 @@ For development and controller behavior validation without building or deploying
 *   **`scripts/4-locale.sh`**: Validates the core namespace filtering and cleanup behavior.
 *   **`scripts/5-test-resilience.sh`**: Tests the operator's ability to recover missed events after a crash or downtime.
 *   **`scripts/6-test-edge-case.sh`**: Verifies the operator does not panic when a trapped pod is deleted mid-reconciliation.
-*   **`scripts/7-test-concurrency.sh`**: Evaluates the operator's performance when simultaneously handling offloading events for multiple namespaces and multiple target clusters (`cluster-alpha` and `cluster-beta`).
+*   **`scripts/7-test-concurrency.sh`**: Evaluates the operator's performance when simultaneously handling offloading events for multiple namespaces and multiple target clusters (`cluster-remote` and `cluster-alpha`).
+*   **`scripts/8-test-multi-cluster-spread.sh`**: Proves that a single `NamespaceOffloading` policy created with multiple target clusters (`cluster-remote,cluster-alpha`) distributes multi-replica workloads across all peered virtual nodes using `topologySpreadConstraints`.
 
 These scripts automatically ensure the necessary infrastructure is present by invoking `1-setup.sh` as needed.
 

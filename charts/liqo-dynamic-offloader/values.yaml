@@ -32,12 +32,14 @@ affinity: {}
 config:
   targetClusterIDs: ""
   allowedNamespaces: ""
-  excludedNamespaces: "kube-*,*-system,local-path-storage,crownlabs-system"
+  excludedNamespaces: "kube-*,*-system,local-path-storage"
   trapWhitelistLabels: ""
   trapBlacklistLabels: ""
   cleanupWhitelistLabels: ""
   cleanupBlacklistLabels: ""
   trapBackoff: "2s"
+  # Force-sync attempts per trapped pod before giving up (0 = unlimited).
+  trapMaxForceSync: 5
   cleanupDelay: "10s"
   enableTrap: true
   enableCleanup: true

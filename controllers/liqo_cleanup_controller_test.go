@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,11 +235,69 @@ func TestLiqoCleanupReconciler_EdgeCases(t *testing.T) {
 		CleanupDelay: 10 * time.Minute,
 		DryRun:       true,
 	}
-	if _, err := reconcilerDryRun.Reconcile(ctx, req); err != nil {
+	result, err := reconcilerDryRun.Reconcile(ctx, req)
+	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
+	}
+	if result.RequeueAfter > 0 {
+		// The annotation is never written in dry-run, so a requeue would loop forever.
+		t.Errorf("Dry-run must not requeue, got RequeueAfter=%v", result.RequeueAfter)
 	}
 	_ = fakeClient.Get(ctx, types.NamespacedName{Name: "offloading", Namespace: namespace}, checkCR)
 	if checkCR.GetAnnotations()[emptySinceAnnotation] != "" {
 		t.Errorf("Expected annotation NOT to be set because DryRun is true")
+	}
+}
+
+// TestLiqoCleanupReconciler_InvalidEmptySince verifies that an unreadable
+// empty-since annotation restarts the countdown instead of deleting the
+// policy at once.
+func TestLiqoCleanupReconciler_InvalidEmptySince(t *testing.T) {
+	ctx := context.TODO()
+	s := scheme.Scheme
+	_ = corev1.AddToScheme(s)
+
+	namespace := "default"
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(createCleanupNamespace(namespace), createCleanupOffloadingCR(namespace, "2026-11-03 10:01")).
+		WithIndex(&corev1.Pod{}, "metadata.namespace", func(obj client.Object) []string {
+			return []string{obj.GetNamespace()}
+		}).
+		Build()
+	recorder := record.NewFakeRecorder(10)
+	reconciler := &LiqoCleanupReconciler{
+		Client:       fakeClient,
+		CleanupDelay: 10 * time.Minute,
+		Recorder:     recorder,
+	}
+
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: namespace}}
+	result, err := reconciler.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if result.RequeueAfter != reconciler.CleanupDelay {
+		t.Errorf("RequeueAfter = %v; want the full cleanup delay %v", result.RequeueAfter, reconciler.CleanupDelay)
+	}
+
+	// The policy must survive, with a readable and recent countdown start.
+	checkCR := &unstructured.Unstructured{}
+	checkCR.SetGroupVersionKind(schema.GroupVersionKind{Group: "offloading.liqo.io", Version: "v1beta1", Kind: "NamespaceOffloading"})
+	if err := fakeClient.Get(ctx, types.NamespacedName{Name: "offloading", Namespace: namespace}, checkCR); err != nil {
+		t.Fatalf("Policy was deleted, want it kept: %v", err)
+	}
+	restartedAt, err := time.Parse(time.RFC3339, checkCR.GetAnnotations()[emptySinceAnnotation])
+	if err != nil || time.Since(restartedAt) > time.Minute {
+		t.Errorf("empty-since = %q; want a valid timestamp of about now", checkCR.GetAnnotations()[emptySinceAnnotation])
+	}
+
+	select {
+	case event := <-recorder.Events:
+		if !strings.Contains(event, "Warning InvalidEmptySince") {
+			t.Errorf("Unexpected event %q", event)
+		}
+	default:
+		t.Error("Expected an InvalidEmptySince warning event, got none")
 	}
 }

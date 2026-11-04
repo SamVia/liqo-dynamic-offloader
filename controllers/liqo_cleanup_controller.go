@@ -2,6 +2,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
@@ -70,10 +71,8 @@ const emptySinceAnnotation = "dynamic-offloader.liqo.io/empty-since"
 // rather than an in-memory timer.
 func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	// Requests come from pod events, so they always carry the pod's namespace.
 	namespace := req.Namespace
-	if namespace == "" {
-		namespace = req.Name
-	}
 
 	// Fail fast: validate namespace name patterns BEFORE any API server Get
 	if !r.isNamespaceNameAllowed(namespace) {
@@ -117,9 +116,8 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	for _, pod := range podList.Items {
 		explicitTarget := r.podTargetsAllowedCluster(ctx, &pod)
 		scheduledRemote := r.isLiqoRemotePod(ctx, &pod)
-		isPendingRemote := pod.Status.Phase == corev1.PodPending && pod.Spec.NodeName == "" && explicitTarget
 
-		if explicitTarget || scheduledRemote || isPendingRemote {
+		if explicitTarget || scheduledRemote {
 			isTerminating := !pod.DeletionTimestamp.IsZero()
 			isTerminalPhase := pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 
@@ -148,6 +146,15 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 		emptySinceStr, hasAnnotation := annotations[emptySinceAnnotation]
 		if !hasAnnotation {
+			if r.DryRun {
+				// The annotation is never written in dry-run, so a requeue would
+				// only repeat this branch forever. Report the whole plan once.
+				logger.Info("[DRY RUN] Would set empty-since annotation", "namespace", namespace)
+				logger.Info("[DRY RUN] Would delete NamespaceOffloading if the namespace stays empty for the cleanup delay",
+					"namespace", namespace, "delay", r.CleanupDelay)
+				return ctrl.Result{}, nil
+			}
+
 			originalCR := offloadCR.DeepCopy()
 
 			// Start a durable countdown instead of deleting immediately. This
@@ -155,18 +162,39 @@ func (r *LiqoCleanupReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			annotations[emptySinceAnnotation] = time.Now().UTC().Format(time.RFC3339)
 			offloadCR.SetAnnotations(annotations)
 
-			if !r.DryRun {
-				if err := r.Patch(ctx, offloadCR, client.MergeFrom(originalCR)); err != nil {
-					return ctrl.Result{}, err
-				}
-				logger.Info("Namespace is empty. Starting cleanup countdown.", "namespace", namespace, "delay", r.CleanupDelay)
-			} else {
-				logger.Info("[DRY RUN] Would set empty-since annotation", "namespace", namespace)
+			if err := r.Patch(ctx, offloadCR, client.MergeFrom(originalCR)); err != nil {
+				return ctrl.Result{}, err
 			}
+			logger.Info("Namespace is empty. Starting cleanup countdown.", "namespace", namespace, "delay", r.CleanupDelay)
 			return ctrl.Result{RequeueAfter: r.CleanupDelay}, nil
 		}
 
-		emptySince, _ := time.Parse(time.RFC3339, emptySinceStr)
+		emptySince, err := time.Parse(time.RFC3339, emptySinceStr)
+		if err != nil {
+			// An unreadable value would parse as the zero time and delete the
+			// policy at once, skipping the grace period. Restart the countdown
+			// from now instead, and say so on the policy.
+			if r.DryRun {
+				logger.Info("[DRY RUN] Would restart cleanup countdown: invalid empty-since annotation", "namespace", namespace, "value", emptySinceStr)
+				return ctrl.Result{}, nil
+			}
+
+			restartedAt := time.Now().UTC().Format(time.RFC3339)
+			originalCR := offloadCR.DeepCopy()
+			annotations[emptySinceAnnotation] = restartedAt
+			offloadCR.SetAnnotations(annotations)
+
+			if err := r.Patch(ctx, offloadCR, client.MergeFrom(originalCR)); err != nil {
+				return ctrl.Result{}, err
+			}
+			logger.Info("Invalid empty-since annotation. Restarted cleanup countdown.",
+				"namespace", namespace, "invalidValue", emptySinceStr, "emptySince", restartedAt)
+			if r.Recorder != nil {
+				r.Recorder.Event(offloadCR, corev1.EventTypeWarning, "InvalidEmptySince",
+					fmt.Sprintf("Ignored invalid %s value %q; cleanup countdown restarted at %s.", emptySinceAnnotation, emptySinceStr, restartedAt))
+			}
+			return ctrl.Result{RequeueAfter: r.CleanupDelay}, nil
+		}
 		if time.Since(emptySince) >= r.CleanupDelay {
 			if !r.DryRun {
 				// Delete only after the namespace has stayed empty for the full
@@ -270,6 +298,15 @@ func (r *LiqoCleanupReconciler) podTargetsAllowedCluster(ctx context.Context, po
 	if pod.Spec.NodeSelector == nil {
 		return false
 	}
+	if pod.Spec.NodeSelector["liqo.io/type"] == "virtual-node" {
+		return true
+	}
+	if remoteID, ok := pod.Spec.NodeSelector["liqo.io/remote-cluster-id"]; ok {
+		if len(r.TargetClusters) > 0 {
+			return r.clusterAllowed(remoteID)
+		}
+		return true
+	}
 	target := pod.Spec.NodeSelector["kubernetes.io/hostname"]
 	if len(r.TargetClusters) > 0 {
 		return r.clusterAllowed(target)
@@ -297,12 +334,12 @@ func (r *LiqoCleanupReconciler) isLiqoRemotePod(ctx context.Context, pod *corev1
 	if len(r.TargetClusters) == 0 {
 		return remoteClusterID != "" || r.checkRemoteNode(ctx, pod.Spec.NodeName) || strings.HasPrefix(pod.Spec.NodeName, "virtual-node-")
 	}
-	return r.clusterAllowed(remoteClusterID) || r.clusterAllowed(pod.Spec.NodeName) || r.clusterAllowed(pod.Spec.NodeSelector["kubernetes.io/hostname"])
+	return r.clusterAllowed(remoteClusterID) || r.clusterAllowed(pod.Spec.NodeName) || r.clusterAllowed(pod.Spec.NodeSelector["kubernetes.io/hostname"]) || r.clusterAllowed(pod.Spec.NodeSelector["liqo.io/remote-cluster-id"])
 }
 
 // isLiqoRemoteNode identifies Liqo virtual nodes by metadata or name prefix.
 func isLiqoRemoteNode(node corev1.Node) bool {
-	return node.Labels["liqo.io/remote-cluster-id"] != "" || strings.HasPrefix(node.Name, "virtual-node-")
+	return node.Labels["liqo.io/remote-cluster-id"] != "" || strings.HasPrefix(node.Name, "virtual-node-") || node.Labels["liqo.io/type"] == "virtual-node"
 }
 
 // LiqoCleanupPredicate filters events to pod lifecycle changes that can alter

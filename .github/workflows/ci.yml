@@ -31,8 +31,9 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
-      - name: Run Envtests
-        run: go test -v ./...
+      # -race reports concurrent access to shared memory without synchronization.
+      - name: Run unit tests
+        run: go test -race -v ./...
 
       - name: Build binary
         run: go build -o bin/manager main.go
